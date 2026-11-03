@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/Fukaki-Ato/reqslim/actions/workflows/ci.yml/badge.svg)](https://github.com/Fukaki-Ato/reqslim/actions/workflows/ci.yml)
 
+[简体中文](README.md) | [English](README.en.md)
+
 挂在 ZCode 前面的请求削减层 —— **不改回答，只减请求**。
 
 编码 Agent 一个任务几十轮、几十次工具调用，其中大量请求是重复的、可预测的，或者根本不需要问模型。`reqslim` 是一个本地代理，把这些请求拦下来，把「逻辑上问了几次」和「物理上打了几次上游」分开记账，每一笔节省都能归因到具体机制。
@@ -101,6 +103,8 @@ duplicates      5   storms 5   near-dupes 2
 
 `near-dupes` 是最后一轮相同但历史不同的请求 —— 缓存不了，但数字高说明上下文在膨胀。
 
+![实时流量报告（合成演示数据）](docs/assets/report-demo.png)
+
 ---
 
 ## 安装（可选）
@@ -113,12 +117,12 @@ duplicates      5   storms 5   near-dupes 2
 pip install -e .        # 提供 reqslim-zcode 命令
 ```
 
-需要 **Python 3.9+**（`requires-python` 里声明；本机验证过 3.11 与 3.13）。
+需要 **Python 3.9+**（`requires-python` 里声明；CI 覆盖 3.9 / 3.11 / 3.13 × Windows / Linux）。
 
 ## 测试
 
 ```bash
-python -m pytest        # 32 个用例
+python -m pytest        # 38 个用例
 ```
 
 不装 pytest 也能跑，测试文件自带最小 runner：
@@ -141,8 +145,8 @@ reqslim/
     ├── analytics.py   流量记录与统计
     ├── proxy.py       代理主逻辑
     └── __main__.py    CLI
-tools/install_zcode.py 安装器（探测 + 改写 provider 表 + 生成启动器）
-tests/test_zcode.py    32 个用例
+tools/install_zcode.py 安装器（探测 + 改写 provider 表 + 注册自启）
+tests/test_zcode.py    38 个用例
 docs/                  ZCode 接入指南
 ```
 
