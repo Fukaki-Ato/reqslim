@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reqslim"
+description = "A transparent request-reduction proxy for the ZCode coding agent."
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["llm", "agent", "caching", "cost-reduction", "proxy", "anthropic", "zcode"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+license = { text = "MIT" }
+# No runtime dependencies on purpose: the core must be mountable on any harness
+# without dragging a dependency tree into it.
+dependencies = []
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/Fukaki-Ato/reqslim"
+Changelog = "https://github.com/Fukaki-Ato/reqslim/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+reqslim-zcode = "reqslim.zcode.__main__:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "reqslim.__version__" }
+
+# Only the package itself. tests/ and tools/ are not distributable modules --
+# tools/ is an installer you run from a checkout, not an import.
+[tool.setuptools.packages.find]
+include = ["reqslim*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

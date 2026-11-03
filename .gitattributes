@@ -1,0 +1,15 @@
+# Normalize line endings across platforms.
+* text=auto
+
+# Batch files must keep CRLF: some cmd.exe label constructs misbehave with LF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Shell scripts must keep LF.
+*.sh text eol=lf
+
+# These are generated on each machine by tools/install_zcode.py -- never commit.
+start-zcode.bat -text
+start-zcode.sh -text
+zcode-stats.bat -text
+zcode-report.bat -text
