@@ -31,7 +31,13 @@ from pathlib import Path
 
 from .analytics import load_events
 from .proxy import ZCodeProxy
-from .wiring import find_table, generate_proxied_table
+from .wiring import (
+    find_table,
+    generate_proxied_table,
+    rewrite_runtime_cache_file,
+    runtime_cache_files,
+    runtime_cache_root,
+)
 
 DEFAULT_UPSTREAM = "https://open.bigmodel.cn/api/anthropic"
 
@@ -194,6 +200,62 @@ class TableWatcher:
             self.tick()
 
 
+class CacheWatcher:
+    """Keeps ZCode's runtime provider caches pointed at reqslim.
+
+    A ZCode update unpacks a new per-version directory under
+    ``~/.zcode/v2/runtime/provider`` whose cloud-refreshed table carries the
+    original baseUrls -- and the agent host reads that table BEFORE the
+    env-var file, so the new version silently bypasses the proxy (observed
+    live on 3.17.2 right after an upgrade). The installer rewrites the
+    caches that exist at install time; this loop catches the ones that
+    appear later, through the same ``rewrite_runtime_cache_file``. Each tick
+    stats every cache file and reparses only the changed ones; rewrites are
+    idempotent, so the steady state is stat-only.
+    """
+
+    def __init__(self, mapping: dict[str, str], root: Path | None = None, log=None) -> None:
+        self.mapping = dict(mapping)
+        self.root = root
+        self.log = log or (lambda message: None)
+        self.last: dict[Path, tuple[int, int]] = {}
+
+    def tick(self) -> list[Path]:
+        """Run one check; returns the cache files rewritten by it."""
+        rewritten: list[Path] = []
+        current: set[Path] = set()
+        for path in runtime_cache_files(self.root):
+            current.add(path)
+            try:
+                stat = path.stat()
+            except OSError:
+                self.last.pop(path, None)
+                continue
+            signature = (stat.st_mtime_ns, stat.st_size)
+            if self.last.get(path) == signature:
+                continue
+            try:
+                action = rewrite_runtime_cache_file(path, self.mapping)
+            except (OSError, ValueError) as exc:
+                # Most likely the cloud refresher holds the file mid-write:
+                # drop the signature and try again next tick.
+                self.last.pop(path, None)
+                self.log(f"runtime cache rewrite deferred: {path} ({exc})")
+                continue
+            if action == "rewritten":
+                rewritten.append(path)
+                self.log(f"runtime cache rewritten: {path}")
+            if action != "unreadable":
+                self.last[path] = signature
+        for gone in set(self.last) - current:
+            self.last.pop(gone, None)
+        return rewritten
+
+    def loop(self, stop: threading.Event, poll_seconds: float) -> None:
+        while not stop.wait(poll_seconds):
+            self.tick()
+
+
 # ----------------------------------------------------------------------- main
 def run_autostart(args: argparse.Namespace) -> int:
     spec = load_autostart_config(args.autostart_config or default_autostart_config_path())
@@ -212,6 +274,12 @@ def run_autostart(args: argparse.Namespace) -> int:
             print(f"provider table regenerated -> {proxied}", flush=True)
     except Exception as exc:  # noqa: BLE001 - never block startup on the table
         print(f"provider table refresh failed, keeping previous copy: {exc}", flush=True)
+
+    cache_watcher = CacheWatcher(mapping, log=print)
+    try:
+        cache_watcher.tick()
+    except Exception as exc:  # noqa: BLE001 - never block startup on the cache
+        print(f"runtime cache rewrite failed: {exc}", flush=True)
 
     served = [port for port, _ in spec.listeners if reqslim_on_port(port)]
     if len(served) == len(spec.listeners):
@@ -241,12 +309,17 @@ def run_autostart(args: argparse.Namespace) -> int:
         target=watcher.loop, args=(stop, spec.poll_seconds),
         daemon=True, name="reqslim-table-watch",
     ).start()
+    threading.Thread(
+        target=cache_watcher.loop, args=(stop, spec.poll_seconds),
+        daemon=True, name="reqslim-cache-watch",
+    ).start()
 
     print("reqslim zcode proxy (autostart)", flush=True)
     for port, url in spec.listeners:
         print(f"  http://{args.host}:{port}  ->  {url}", flush=True)
     print(f"  watching  {spec.zcode_table} (every {spec.poll_seconds:.0f}s)", flush=True)
     print(f"  table ->  {proxied}", flush=True)
+    print(f"  caches    {runtime_cache_root()} (every {spec.poll_seconds:.0f}s)", flush=True)
     if record_path:
         print(f"  recording {record_path}", flush=True)
     print(f"  stats     http://{args.host}:{spec.listeners[0][0]}/v1/stats", flush=True)

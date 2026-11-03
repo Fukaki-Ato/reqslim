@@ -12,7 +12,7 @@
 
 在一台**装有 ZCode 的新设备**上，把 reqslim 代理装到 ZCode 前面：
 
-- ZCode 的所有 `anthropic-messages` 协议请求改走本地代理（只改 provider 表副本 + 环境变量，不改 ZCode 安装目录、不改用户配置、不碰登录凭据）；
+- ZCode 的所有 `anthropic-messages` 协议请求改走本地代理（改写 provider 表副本、环境变量与运行时缓存表，均留备份；不改 ZCode 安装目录、不改用户设置、不碰登录凭据）；
 - 代理按**上游网关**分端口监听（默认从 8788 递增），一个进程管所有端口；
 - 验收标准：ZCode 回答内容不变、`/v1/health` 可达、`requests.jsonl` 随真实使用增长。
 
@@ -216,7 +216,8 @@ dry run: nothing written
 
 | 产物 | 路径 | 作用 |
 |------|------|------|
-| 改写后的 provider 表 | `~/.zcode/reqslim/zcode-builtin.proxied.json` | 运行时经 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 生效 |
+| 改写后的 provider 表 | `~/.zcode/reqslim/zcode-builtin.proxied.json` | 环境变量指向的回落表：缓存尚未生成的新机器/新版本读它 |
+| 运行时缓存表改写 | `~/.zcode/v2/runtime/provider/*/*/endpoint-*/zcode-builtin.json` | agent 宿主**优先读取**的表（asar 证实，环境变量只是回落）；原件备份同目录 `.bak-reqslim`，卸载时还原 |
 | 原表备份副本 | `~/.zcode/reqslim/zcode-builtin.original.json` | 仅供 diff 参考，运行时不读 |
 | 自启配置 | `~/.zcode/reqslim/autostart.json` | `--autostart` 模式读：监听表、记录路径、ZCode 表路径 |
 | 无窗口代理入口 | `~/.zcode/reqslim/proxy_autostart.pyw` | pythonw 启动，日志重定向 `proxy.log` |
@@ -232,6 +233,8 @@ POSIX 上仅生成手动启动器（自启未实现），把 `start-zcode.sh` �
 ```bash
 python -c "import json; d=json.load(open(r'<HOME>/.zcode/reqslim/zcode-builtin.proxied.json', encoding='utf-8')); print('written')"
 ```
+
+再跑一次 `python tools/install_zcode.py --dry-run`：所有运行时缓存表应显示 `untouched`（首次安装为 rewritten），说明 agent 宿主实际优先读取的缓存层也已接上。
 
 **失败分支**：安装器报 `cannot bind` 类错误不会在这一步（安装器不绑端口）；
 端口冲突在步骤 6 才暴露，见下。
@@ -283,7 +286,7 @@ powershell -NoProfile -Command "irm http://127.0.0.1:8788/v1/health"
   - `cannot bind ... port is taken / reserved range` → 换 `--port 18888`（或其他空闲口）重跑步骤 4–5；
   - `reqslim cannot be imported` → 回步骤 1 的验证，检查 `$REQSLIM` 位置是否被挪动。
   - 修好后**重新跑安装器**再启动（启动器内嵌端口，改口必须重装）。
-- 健康检查 OK 但 ZCode 请求全挂 → 检查 ZCode 是否经启动器启动（直接点任务栏图标 = 无环境变量 = 直连上游或用旧配置）。
+- 健康检查 OK 但 ZCode 请求全挂 → 逐层确认 provider 的 `baseUrl` 真的指向 `127.0.0.1`：环境变量表 `~/.zcode/reqslim/zcode-builtin.proxied.json` **之外**，还要查运行时缓存表 `~/.zcode/v2/runtime/provider/<版本>/endpoint-*/zcode-builtin.json`（agent 宿主优先读它）；改写后必须重启 ZCode 才会重建 provider registry。
 
 **验收（三选一都过才算完成）**：
 

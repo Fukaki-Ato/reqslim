@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2 (2026-11-03)
+
+**修复回归：恢复运行时 provider 缓存表改写（0.1.0 的关键修复在 0.2.0 重构中丢失）**
+
+- 反编译 ZCode 3.16.3 与 3.17.2 的 asar 确认：agent 宿主进程**优先读云端刷新的运行时缓存表**（`~/.zcode/v2/runtime/provider/<平台>/<版本>/endpoint-*/zcode-builtin.json`），`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 指向的表只是回落——0.2.0 的「环境变量 + proxied 副本」机制在已有缓存的机器上会被静默绕过。本机 3.17.2 升级后实测复现：请求直连，`requests` 归零，且重跑安装器无效
+- 安装器恢复缓存表改写：glob 所有版本目录逐份改写、每份一次性 `.bak-reqslim` 备份（重复运行与云刷新都不覆盖）、幂等；`--dry-run` 可预览
+- 代理 `--autostart` 新增缓存表监视线程（`CacheWatcher`）：ZCode 升级带来的新版本缓存一分钟内自动改写，与 bundled 表监视共用 wiring 逻辑
+- `--uninstall` 从 `.bak-reqslim` 还原所有缓存表——否则摘掉代理后 ZCode 永远指向死端口（永久 ECONNREFUSED）
+- 修正安装器头注释与《ZCode 接入指南》§1 对读取优先级的错误断言；排查表补「升级后 requests 归零」「本地校验拒绝（零网络连接）」两行
+- 测试 44 → 49
+
 ## 0.2.1 (2026-11-03)
 
 **修复(遗留审计项,按修复方案设计全部落地)**

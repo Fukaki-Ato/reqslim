@@ -11,11 +11,23 @@ Nothing here assumes a particular drive letter, user name or install path:
 * machine-specific state (config copy, request log, autostart entries) lives
   under the user's home directory, never next to the code.
 
-How it works: ZCode resolves its provider table from
-``<resources>/config/provider/zcode-builtin.json``, but the main process honours
-``ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`` first (verified in the shipped asar).
-So the installer copies that table, rewrites the ``baseUrl`` of the providers
-you actually use to a local proxy, and points ZCode at the rewritten copy.
+How it works: ZCode has TWO provider tables, and the env var decides only
+the second one (read order verified in the shipped 3.16/3.17 asar):
+
+1. the cloud-refreshed runtime cache,
+   ``~/.zcode/v2/runtime/provider/<platform>/<version>/endpoint-*/zcode-builtin.json``,
+   read FIRST by the agent host -- an unrewritten cache silently bypasses
+   the proxy, and every ZCode update unpacks a fresh one;
+2. the ``ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`` target (itself falling back
+   to the bundled ``<resources>/config/provider/zcode-builtin.json``), read
+   only when the cache is missing -- what a fresh machine or a freshly
+   updated version relies on before its first cache exists.
+
+So the installer does both: it copies the bundled table, rewrites the
+``baseUrl`` of the providers you actually use to a local proxy, points the
+env var at that rewritten copy, and rewrites every runtime cache already on
+disk (one ``.bak-reqslim`` backup each, created once; ``--uninstall``
+restores them).
 Providers of one account family can sit on different gateways (API-key
 templates and plan accounts do), so each distinct upstream gets its own local
 port inside one proxy process:
@@ -33,8 +45,8 @@ With autostart (default, Windows), daily use needs no launcher at all:
 * a shortcut in the user's Startup folder launches that at logon;
 * the env var above is set at user level, so ZCode routes through reqslim no
   matter how it is started (taskbar, Start menu, another tool);
-* the proxy watches ZCode's bundled provider table and regenerates the
-  rewritten copy within a minute of a ZCode update changing it, so new
+* the proxy watches ZCode's bundled provider table AND the runtime provider
+  caches, regenerating both within a minute of a ZCode update, so new
   providers and template revisions keep flowing through reqslim without a
   reinstall.
 
@@ -64,7 +76,9 @@ from reqslim.zcode.wiring import (  # noqa: E402
     _posix_candidates,
     _windows_candidates,
     generate_proxied_table,
+    restore_runtime_caches,
     rewrite_config,
+    rewrite_runtime_caches,
     uncovered_upstreams,
 )
 
@@ -349,7 +363,12 @@ def start_proxy_now(python_exe: str, pyw: Path, module_dir: Path, port: int) -> 
 
 
 def uninstall(config_dir: Path) -> int:
-    """Remove everything the installer created; keep the request log."""
+    """Remove everything the installer created; keep the request log.
+
+    Runtime provider caches are restored from their one-time ``.bak-reqslim``
+    backups first: a cache left pointing at reqslim's ports is a permanent
+    ECONNREFUSED once the proxy is gone.
+    """
     removed: list[str] = []
 
     if os.name == "nt":
@@ -363,6 +382,11 @@ def uninstall(config_dir: Path) -> int:
         )
         if result.returncode == 0:
             removed.append(f"user env var {ENV_VAR}")
+
+    for path in restore_runtime_caches(
+        log=lambda message: print(f"note        {message}")
+    ):
+        removed.append(f"{path} (restored from .bak-reqslim)")
 
     for name in MANAGED_FILES:
         candidate = config_dir / name
@@ -626,13 +650,34 @@ def main(argv: list[str] | None = None) -> int:
         print("            pass --extra-upstream <url> to route these through reqslim too")
 
     if args.dry_run:
-        print("dry run: nothing written")
+        for path, action in rewrite_runtime_caches(mapping, dry_run=True):
+            if action == "rewritten":
+                print(f"            would rewrite {path}")
+            elif action == "unreadable":
+                print(f"            unreadable, skipped {path}")
+        print("dry run: nothing written (runtime provider caches included)")
         return 0
 
     config_dir.mkdir(parents=True, exist_ok=True)
     generate_proxied_table(install.table, mapping, proxied)
     shutil.copy2(install.table, config_dir / "zcode-builtin.original.json")
     write_autostart_config(config_dir, listeners, install.table, record)
+
+    # The env-var table alone is not enough: ZCode reads its runtime caches
+    # first, so every version directory on disk must be rewritten too (the
+    # 0.2.0 regression -- traffic bypassed the proxy until this ran).
+    cache_actions = rewrite_runtime_caches(mapping)
+    if cache_actions:
+        counts: dict[str, int] = {}
+        for _, action in cache_actions:
+            counts[action] = counts.get(action, 0) + 1
+        summary = ", ".join(f"{count} {action}" for action, count in sorted(counts.items()))
+        print(f"cache       runtime provider caches: {summary}")
+        for path, action in cache_actions:
+            if action == "rewritten":
+                print(f"            rewritten {path} (.bak-reqslim backup kept once)")
+            elif action == "unreadable":
+                print(f"            unreadable, skipped {path}")
 
     if os.name == "nt":
         launcher = write_windows_launcher(module_dir, install.exe, listeners)

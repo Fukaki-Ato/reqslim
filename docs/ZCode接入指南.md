@@ -5,7 +5,7 @@
 适用于任何装了 ZCode 的设备。文中不写死盘符和用户名，所有路径都用占位符或环境变量表示。
 
 - **不改** ZCode 安装目录
-- **不改** ZCode 的用户配置
+- **不改** ZCode 的用户设置；会改写它的 provider 表副本与运行时缓存表（均有备份，卸载自动还原）
 - **不碰** 你的登录凭据
 - 随时可以摘掉，摘掉后行为与原来完全一致
 
@@ -49,9 +49,12 @@ $ZCODE_HOME
 
 ## 1. 它是怎么接进去的
 
-ZCode 从 `<ZCode 安装目录>\resources\config\provider\zcode-builtin.json` 读取 provider 表。主进程启动时会先看环境变量 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`，有值就用它，没有才回落到安装目录。
+ZCode 有两层 provider 表（3.16/3.17 的 asar 反编译证实，读取顺序如下）：
 
-所以接入方式只有一步：**启动时换一份 provider 表**，把 `baseUrl` 指向本机代理。
+1. **运行时缓存表**：`%USERPROFILE%\.zcode\v2\runtime\provider\<平台>\<版本>\endpoint-<哈希>\zcode-builtin.json`，由云端定期刷新；**agent 宿主进程优先读它**。每次 ZCode 升级都会在新版本目录下生成一份新的——不改写它，流量就静默直连（环境变量形同虚设）。
+2. **环境变量表**：`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 指向的文件，只是第 1 层读失败时的回落。全新机器或刚升级、缓存还没生成时靠它兜底。
+
+所以接入必须两层都做：安装器**逐份改写运行时缓存表**（每份留一个 `.bak-reqslim` 备份，只备份一次；幂等，重复运行显示 untouched），同时生成改写过的环境变量表 `%USERPROFILE%\.zcode\reqslim\zcode-builtin.proxied.json`。代理后台每分钟检查两层：ZCode 更新换表、云刷新覆盖缓存，都会在一分钟内被重新改写。
 
 ```
 ZCode ──HTTP──> 127.0.0.1:8788（reqslim） ──HTTPS──> 上游 API
@@ -84,6 +87,8 @@ listen      127.0.0.1:8788  ->  https://open.bigmodel.cn/api/anthropic
 listen      127.0.0.1:8789  ->  https://zcode.z.ai/api/v1/zcode-plan/anthropic
             account:zai-start-plan, account:bigmodel-start-plan
 launcher    <模块目录>\start-zcode.bat
+cache       runtime provider caches: 1 rewritten, 1 untouched
+            rewritten %USERPROFILE%\.zcode\v2\runtime\provider\windows-x86_64\3.17.2\endpoint-<哈希>\zcode-builtin.json
 ```
 
 一个上游一行 `listen`。如果 `zcode` 那行报错说找不到，手动指一下：
@@ -110,6 +115,8 @@ python tools\install_zcode.py --zcode-dir "<ZCode 安装目录>"
 | `zcode-builtin.original.json` | 原表备份，出问题可对比 |
 | `requests.jsonl` | 运行后生成，逐请求记录 |
 
+**ZCode 运行时缓存目录**（`%USERPROFILE%\.zcode\v2\runtime\provider\<平台>\<版本>\endpoint-<哈希>\`）：`zcode-builtin.json` 被逐份改写，原件备份为同目录的 `zcode-builtin.json.bak-reqslim`（只备份一次，重复运行与云刷新都不覆盖；`--uninstall` 时从备份还原）。
+
 安装器参数：
 
 | 参数 | 说明 |
@@ -134,7 +141,7 @@ python tools\install_zcode.py --zcode-dir "<ZCode 安装目录>"
 **Windows 装好后什么都不用做**：代理已注册到启动文件夹（登录即运行，`pythonw` 无窗口），`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 已设为用户级环境变量——直接打开 ZCode（任务栏 / 开始菜单 / 任何方式），流量自动走代理。
 
 - 代理日志：`%USERPROFILE%\.zcode\reqslim\proxy.log`
-- ZCode 更新后无需重装：代理每分钟检查 ZCode 自带 provider 表，变更后一分钟内自动重新改写接入
+- ZCode 更新后无需重装：代理每分钟检查 ZCode 自带 provider 表**和运行时缓存表**，升级产生的新版本缓存同样在一分钟内自动改写接入
 - 代理已在运行时再点一次启动项无害（检测到等价实例直接退出）
 
 `start-zcode.bat` 保留为手动兜底：换端口调试、或自启项被杀软清掉时用。它会弹一个最小化的黑窗口（代理），然后 ZCode 正常启动，**窗口不能关**。
@@ -290,6 +297,8 @@ python3 -m reqslim.zcode --report "$HOME/.zcode/reqslim/requests.jsonl"
 | 报 401 | 上游没收到 Authorization | 检查是否改用了别的网关；本代理默认透传所有头 |
 | ZCode 更新后失效 | 新版 provider 表结构可能变化 | 重跑一次安装器 |
 | 缓存命中率很低 | 每轮历史都不同，属正常 | 看 `near-dupes`，数字高说明该压缩上下文或拆任务 |
+| ZCode 升级后 `requests` 一直 0 | 新版本的运行时缓存表未被改写（3.17.2 实测会静默直连） | 重跑安装器，或重启一次代理（再点一下自启项）；改写后重启 ZCode 生效 |
+| `Model request failed` 且 ZCode 进程零网络连接 | 本地校验拒绝（如套餐未到生效时间），请求没出网卡 | 查日志里 entitlement 的 `availability` / `effectiveAt`，等生效或换套餐 |
 
 ---
 
@@ -303,7 +312,7 @@ python3 -m reqslim.zcode --report "$HOME/.zcode/reqslim/requests.jsonl"
 python tools/install_zcode.py --uninstall
 ```
 
-它会删掉启动文件夹里的 `reqslim proxy.lnk`、用户级环境变量 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 和 `%USERPROFILE%\.zcode\reqslim\` 下的生成文件（保留 `requests.jsonl` 流量记录）。已开的窗口仍带着旧环境变量，重启 ZCode 后恢复直连；注销/重登录后环境变量从所有新进程消失。
+它会删掉启动文件夹里的 `reqslim proxy.lnk`、用户级环境变量 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 和 `%USERPROFILE%\.zcode\reqslim\` 下的生成文件（保留 `requests.jsonl` 流量记录），并把运行时缓存表从 `.bak-reqslim` 备份还原——否则摘掉代理后 ZCode 会永远指向死端口。已开的窗口仍带着旧环境变量，重启 ZCode 后恢复直连；注销/重登录后环境变量从所有新进程消失。
 
 也可以手动删：删启动项 lnk + `reg delete HKCU\Environment /v ZCODE_BUILTIN_PROVIDER_CONFIG_FILE /f` + 删配置目录。
 
@@ -322,6 +331,8 @@ ZCode 安装目录和用户配置自始至终没有被修改过。
 - **ZCode 更新后表同步有 ≤1 分钟窗口**：自启代理每 60 秒检查一次 ZCode 自带 provider 表，更新落地后的新 provider 在下一次检查时自动接入；若恰好在检查间隙重启 ZCode，那一次启动读到的还是上一份表，之后再自动补齐。
 - **新增网关需要重跑安装器**：表监视只覆盖已知上游上的变化；ZCode 若接入了全新网关（新的 `baseUrl`），需要重跑一次安装器把它加进监听（`--extra-upstream`）。
 - **自启依赖三样东西完好**：Python 解释器路径（lnk 里写死 `pythonw.exe`）、模块目录位置、启动文件夹权限。移动模块文件夹或升级 Python 后重跑一次安装器即可修复；杀软若清掉启动项，手动兜底 `start-zcode.bat` 始终可用。
+- **缓存表改写与云刷新存在竞态**：云端以新 revision 覆盖缓存后，代理的缓存监视会在一分钟内改写回来；窗口期启动的 ZCode 会读到一次未改写的表，下次启动恢复。
+- **改写缓存表需要重启 ZCode 才生效**：provider registry 在 ZCode 启动时构建，运行中改文件不会重建。
 
 ---
 
@@ -338,8 +349,8 @@ ZCode 安装目录和用户配置自始至终没有被修改过。
 │       ├── analytics.py              流量记录与统计
 │       ├── proxy.py                  代理主逻辑
 │       └── __main__.py               CLI
-├── tools\install_zcode.py            安装器（自动探测 + 生成启动器 + 注册自启）
-├── tests\test_zcode.py               32 个用例
+├── tools\install_zcode.py            安装器（自动探测 + 改写 provider 表/缓存表 + 注册自启）
+├── tests\test_zcode.py               49 个用例
 ├── start-zcode.bat                   启动器（安装时生成）
 ├── zcode-stats.bat / zcode-report.bat 报告（安装时生成）
 └── docs\ZCode接入指南.md             本文
@@ -348,4 +359,6 @@ ZCode 安装目录和用户配置自始至终没有被修改过。
 ├── zcode-builtin.proxied.json
 ├── zcode-builtin.original.json
 └── requests.jsonl
+
+%USERPROFILE%\.zcode\v2\runtime\provider\...\  运行时缓存表（改写 + .bak-reqslim 备份）
 ```

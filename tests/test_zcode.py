@@ -33,11 +33,16 @@ from reqslim.zcode import (
 )
 from reqslim.zcode.analytics import Event
 from reqslim.zcode.__main__ import (
+    CacheWatcher,
     load_autostart_config,
     reqslim_on_port,
     TableWatcher,
 )
-from reqslim.zcode.wiring import generate_proxied_table
+from reqslim.zcode.wiring import (
+    generate_proxied_table,
+    restore_runtime_caches,
+    rewrite_runtime_caches,
+)
 
 TEXT = "条款抽取完成"
 
@@ -1124,6 +1129,113 @@ def test_recorder_rotates_on_write_when_over_budget():
         with open(path, encoding="utf-8") as handle:
             assert '"after-rotation"' in handle.read(), \
                 "post-rotation events land in the fresh file"
+
+
+# ---------------------------------------------- runtime provider cache layer
+MAPPING_BIGMODEL = {"https://open.bigmodel.cn/api/anthropic": "http://127.0.0.1:8788"}
+
+
+def _runtime_cache_dir(root: Path, version: str) -> Path:
+    """One ZCode version's cache dir: <root>/<platform>/<version>/endpoint-<hash>."""
+    cache_dir = root / "windows-x86_64" / version / "endpoint-a1b2c3"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def test_runtime_cache_rewrite_backs_up_once_and_is_idempotent():
+    """ZCode reads the runtime cache FIRST (asar-verified): the rewrite must
+    land there, keep exactly one pristine backup, and stay idempotent across
+    installer re-runs and watcher ticks."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        table = _runtime_cache_dir(root, "3.17.2") / "zcode-builtin.json"
+        _write_table(table, [_table_entry("p1", "https://open.bigmodel.cn/api/anthropic")])
+        original = table.read_text(encoding="utf-8")
+
+        assert rewrite_runtime_caches(MAPPING_BIGMODEL, root=root) == [(table, "rewritten")]
+        assert _read_base_urls(table) == {"p1": "http://127.0.0.1:8788"}
+        backup = table.with_name(table.name + ".bak-reqslim")
+        assert backup.exists() and backup.read_text(encoding="utf-8") == original, \
+            "the first rewrite must keep a pristine .bak-reqslim"
+
+        for _ in range(2):  # installer re-run, then a watcher tick
+            assert rewrite_runtime_caches(MAPPING_BIGMODEL, root=root) == [(table, "untouched")]
+        assert backup.read_text(encoding="utf-8") == original, \
+            "re-runs must never overwrite the only pristine backup"
+
+
+def test_runtime_cache_skips_unrelated_and_unreadable_tables():
+    """Caches of other gateways (or a table caught mid-write) must be skipped
+    without breaking the batch -- the autostart watcher runs this forever."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        other = _runtime_cache_dir(root, "3.16.3") / "zcode-builtin.json"
+        _write_table(other, [_table_entry("kimi", "https://api.kimi.com/coding/v1")])
+        broken = _runtime_cache_dir(root, "3.17.1") / "zcode-builtin.json"
+        broken.write_text('{"config": {"providerConfig', encoding="utf-8")
+        ours = _runtime_cache_dir(root, "3.17.2") / "zcode-builtin.json"
+        _write_table(ours, [_table_entry("p1", "https://open.bigmodel.cn/api/anthropic")])
+
+        results = dict(rewrite_runtime_caches(MAPPING_BIGMODEL, root=root))
+        assert results[other] == "unrelated", "another gateway's cache must pass through"
+        assert "127.0.0.1" not in other.read_text(encoding="utf-8")
+        assert results[broken] == "unreadable", "a truncated table must be skipped, not crash"
+        assert results[ours] == "rewritten"
+
+
+def test_runtime_cache_dry_run_decides_but_writes_nothing():
+    """--dry-run must report what WOULD change without touching anything."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        table = _runtime_cache_dir(root, "3.17.2") / "zcode-builtin.json"
+        _write_table(table, [_table_entry("p1", "https://open.bigmodel.cn/api/anthropic")])
+        before = table.read_text(encoding="utf-8")
+
+        assert rewrite_runtime_caches(MAPPING_BIGMODEL, root=root, dry_run=True) == \
+            [(table, "rewritten")]
+        assert table.read_text(encoding="utf-8") == before, "dry run must not write"
+        assert not table.with_name(table.name + ".bak-reqslim").exists(), \
+            "dry run must not create the backup either"
+
+
+def test_restore_runtime_caches_puts_the_originals_back():
+    """--uninstall must undo the rewrites: a cache left pointing at reqslim's
+    dead ports turns into a permanent ECONNREFUSED."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        table = _runtime_cache_dir(root, "3.17.2") / "zcode-builtin.json"
+        _write_table(table, [_table_entry("p1", "https://open.bigmodel.cn/api/anthropic")])
+        original = table.read_text(encoding="utf-8")
+        rewrite_runtime_caches(MAPPING_BIGMODEL, root=root)
+        assert "127.0.0.1" in table.read_text(encoding="utf-8")
+
+        assert restore_runtime_caches(root=root) == [table]
+        assert table.read_text(encoding="utf-8") == original, "the pristine table must be back"
+        assert not table.with_name(table.name + ".bak-reqslim").exists(), "backup is consumed"
+
+
+def test_cache_watcher_rewrites_caches_that_zcode_updates_ship():
+    """A ZCode update unpacks a NEW version directory with original baseUrls;
+    the autostart proxy must rewrite it within one tick (the 3.17.2 lesson)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        watcher = CacheWatcher(MAPPING_BIGMODEL, root=root)
+        assert watcher.tick() == [], "an empty root is a clean no-op"
+
+        _write_table(
+            _runtime_cache_dir(root, "3.17.1") / "zcode-builtin.json",
+            [_table_entry("p1", "https://open.bigmodel.cn/api/anthropic")],
+        )
+        assert len(watcher.tick()) == 1
+        assert watcher.tick() == [], "unchanged caches must not rewrite again"
+
+        _write_table(
+            _runtime_cache_dir(root, "3.17.2") / "zcode-builtin.json",
+            [_table_entry("p1", "https://open.bigmodel.cn/api/anthropic")],
+        )
+        assert len(watcher.tick()) == 1, "the freshly shipped version must be rewritten"
+        table = _runtime_cache_dir(root, "3.17.2") / "zcode-builtin.json"
+        assert _read_base_urls(table) == {"p1": "http://127.0.0.1:8788"}
 
 
 if __name__ == "__main__":

@@ -25,6 +25,6 @@ from __future__ import annotations
 from .cache import ExactCache
 from .types import LLMResponse, Usage
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 __all__ = ["ExactCache", "LLMResponse", "Usage"]

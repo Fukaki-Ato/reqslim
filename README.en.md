@@ -59,12 +59,13 @@ The installer locates the ZCode install, copies the provider table, points its `
 
 - the proxy is registered in the Startup folder and runs at logon via `pythonw` — no console window; logs at `%USERPROFILE%\.zcode\reqslim\proxy.log`;
 - `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` is set as a user-level environment variable — ZCode then routes through the proxy no matter how it is started (taskbar, Start menu, other tools). **No launcher to click, ever**;
-- the proxy checks ZCode's bundled provider table once a minute — **after a ZCode update, newly added providers are picked up within a minute**, no reinstall required.
+- the installer also rewrites ZCode's **runtime provider caches** (`~/.zcode/v2/runtime/provider/...`) — since 3.16 these are what ZCode reads first, the env var is only the fallback (verified in the asar); each cache keeps a one-time `.bak-reqslim` backup;
+- the proxy checks ZCode's bundled provider table and the runtime caches once a minute — **after a ZCode update, newly added providers are picked up within a minute**, no reinstall required.
 
 Daily use: just open ZCode. `start-zcode.bat` remains as a manual fallback (handy for debugging on a different port). Uninstall:
 
 ```bash
-python tools/install_zcode.py --uninstall   # removes the autostart entry and env var; keeps requests.jsonl
+python tools/install_zcode.py --uninstall   # removes autostart + env var, restores the provider caches; keeps requests.jsonl
 ```
 
 Full documentation — options, troubleshooting, rollback — in **[docs/ZCode接入指南.md](docs/ZCode接入指南.md)** (Chinese).
@@ -122,7 +123,7 @@ Requires **Python 3.9+** (declared in `requires-python`; CI covers 3.9 / 3.11 / 
 ## Tests
 
 ```bash
-python -m pytest        # 44 cases
+python -m pytest        # 49 cases
 ```
 
 pytest not required — the test file ships a minimal runner:
@@ -145,8 +146,8 @@ reqslim/
     ├── analytics.py   traffic recording & reporting
     ├── proxy.py       proxy core
     └── __main__.py    CLI
-tools/install_zcode.py installer (probe + rewrite provider table + register autostart)
-tests/test_zcode.py    44 cases
+tools/install_zcode.py installer (probe + rewrite provider tables/caches + register autostart)
+tests/test_zcode.py    49 cases
 docs/                  ZCode integration guides (Chinese)
 ```
 

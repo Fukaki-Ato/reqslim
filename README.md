@@ -59,18 +59,19 @@ python tools/install_zcode.py
 
 - 代理注册到启动文件夹，登录即运行，`pythonw` 无窗口，日志在 `%USERPROFILE%\.zcode\reqslim\proxy.log`；
 - `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 设为用户级环境变量 —— 之后 ZCode 无论从任务栏、开始菜单还是别的工具启动，都自动走代理，**不需要再点任何 bat**；
-- 代理每分钟检查一次 ZCode 自带的 provider 表，**ZCode 更新后新 provider 会在一分钟内自动接入**，无需重装本工具。
+- 安装器同时改写 ZCode 的**运行时 provider 缓存表**（`~/.zcode/v2/runtime/provider/...`）——3.16+ 实际优先读它，环境变量只是回落（asar 反编译证实），每份留 `.bak-reqslim` 备份；
+- 代理每分钟检查一次 ZCode 自带的 provider 表与运行时缓存，**ZCode 更新后新 provider 会在一分钟内自动接入**，无需重装本工具。
 
 日常使用：直接打开 ZCode 即可。`start-zcode.bat` 保留为手动兜底（换端口临时调试时用）。卸载：
 
 ```bash
-python tools/install_zcode.py --uninstall   # 移除自启项与环境变量，保留 requests.jsonl
+python tools/install_zcode.py --uninstall   # 移除自启项与环境变量、还原缓存表，保留 requests.jsonl
 ```
 
 完整说明、参数、排查表、回滚步骤见 **[docs/ZCode接入指南.md](docs/ZCode接入指南.md)**。
 要在另一台设备的 ZCode 上装配（AI agent 可直接执行的分步 runbook）见 **[docs/AI装配指南.md](docs/AI装配指南.md)**。
 
-安装器**不改** ZCode 安装目录、**不改**用户配置、**不碰**登录凭据，随时能摘掉。
+安装器**不改** ZCode 安装目录、**不改**用户设置、**不碰**登录凭据；provider 表与缓存表的改写均有备份，`--uninstall` 自动还原。
 
 ### 多上游
 
@@ -122,7 +123,7 @@ pip install -e .        # 提供 reqslim-zcode 命令
 ## 测试
 
 ```bash
-python -m pytest        # 44 个用例
+python -m pytest        # 49 个用例
 ```
 
 不装 pytest 也能跑，测试文件自带最小 runner：
@@ -145,8 +146,8 @@ reqslim/
     ├── analytics.py   流量记录与统计
     ├── proxy.py       代理主逻辑
     └── __main__.py    CLI
-tools/install_zcode.py 安装器（探测 + 改写 provider 表 + 注册自启）
-tests/test_zcode.py    44 个用例
+tools/install_zcode.py 安装器（探测 + 改写 provider 表/缓存表 + 注册自启）
+tests/test_zcode.py    49 个用例
 docs/                  ZCode 接入指南
 ```
 
