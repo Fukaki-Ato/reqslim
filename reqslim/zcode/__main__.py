@@ -220,6 +220,7 @@ def run_autostart(args: argparse.Namespace) -> int:
 
     proxy = ZCodeProxy(
         spec.listeners[0][1],
+        coalesce_wait=args.coalesce_wait,
         record_path=record_path,
     )
     try:
@@ -281,6 +282,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-cache", type=int, default=4096)
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--no-coalesce", action="store_true")
+    parser.add_argument(
+        "--coalesce-wait", type=float, default=600.0, metavar="SECONDS",
+        help="follower budget waiting for an in-flight leader; past it the "
+             "follower forwards concurrently (0 waits forever; default 600)",
+    )
     parser.add_argument("--failure-ttl", type=float, default=20.0, help="0 disables the failure memo")
     parser.add_argument("--record", default=None, help="JSONL path (default: ~/.zcode/reqslim/requests.jsonl)")
     parser.add_argument("--no-record", action="store_true")
@@ -311,6 +317,7 @@ def main(argv: list[str] | None = None) -> int:
         max_cache=args.max_cache,
         cache_enabled=not args.no_cache,
         coalesce=not args.no_coalesce,
+        coalesce_wait=args.coalesce_wait,
         failure_ttl=args.failure_ttl,
         record_path=record_path,
     )

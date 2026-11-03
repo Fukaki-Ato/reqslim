@@ -161,10 +161,28 @@ class Fingerprint:
     tail: str
     n_messages: int
     kind: str
+    beta: str = ""
 
     @property
     def short(self) -> str:
         return self.key[:12]
+
+
+def beta_tag(headers: Mapping[str, str]) -> str:
+    """Canonical ``anthropic-beta`` value for cache keys.
+
+    The beta switches a request carries change what the answer may look like,
+    so they are part of the key -- but only the *set* matters: clients differ
+    in feature order and spacing. Empty string when the header is absent,
+    which leaves the key shape unchanged for requests without it.
+    """
+    raw = ""
+    for name, value in headers.items():
+        if name.lower() == "anthropic-beta":
+            raw = value
+    if not raw.strip():
+        return ""
+    return ",".join(sorted(p.strip().lower() for p in raw.split(",") if p.strip()))
 
 
 def _compaction_text(payload: Mapping[str, Any]) -> str:
@@ -212,8 +230,10 @@ def classify(payload: Mapping[str, Any]) -> str:
     return "continuation"
 
 
-def fingerprint(payload: Mapping[str, Any]) -> Fingerprint:
+def fingerprint(payload: Mapping[str, Any], beta: str = "") -> Fingerprint:
     canonical = normalize_request(payload)
+    if beta:
+        canonical["anthropic_beta"] = beta
     messages = canonical.get("messages") or []
     history = messages[:-1]
     tail = messages[-1] if messages else []
@@ -225,6 +245,7 @@ def fingerprint(payload: Mapping[str, Any]) -> Fingerprint:
         tail=_digest(tail),
         n_messages=len(messages),
         kind=classify(payload),
+        beta=beta,
     )
 
 

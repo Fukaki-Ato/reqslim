@@ -105,7 +105,10 @@ class Install:
 def _as_install(root: Path) -> Install | None:
     """Accept either an install root or a resources directory."""
     if (root / PROVIDER_TABLE).exists():
-        exe = root.parent.parent / "MacOS" / "ZCode" if root.name == "Resources" else None
+        # macOS layout: <ZCode.app>/Contents/Resources -> binary is one level
+        # up in Contents/MacOS (path arithmetic per the layout; not verified
+        # on real macOS hardware).
+        exe = root.parent / "MacOS" / "ZCode" if root.name == "Resources" else None
         return Install(resources=root, exe=exe if exe and exe.exists() else None, label=str(root))
     resources = root / "resources"
     if (resources / PROVIDER_TABLE).exists():
@@ -159,42 +162,49 @@ def write_autostart_config(
     return path
 
 
-def write_autostart_pyw(config_dir: Path, module_dir: Path) -> Path:
-    """The windowless proxy entry, launched by pythonw at logon.
+#: The machine-independent body of the pyw entry (braces are literal here;
+#: paths are injected separately through the f-string header).
+_PYW_BODY = '''
 
-    pythonw has no stdout, so every diagnostic would vanish silently; the
-    first thing this wrapper does is redirect both streams into proxy.log.
-    Import goes through an explicit sys.path entry rather than PYTHONPATH:
-    the shortcut passes no environment, and the module dir is the one thing
-    this file knows for certain.
+class _Log:
+    """Append-only sink that rotates the log at LIMIT bytes.
+
+    pythonw has no console, so this file is the only place diagnostics can
+    land -- and the proxy runs for weeks, so a failure loop must not be able
+    to grow it without bound.
     """
-    path = config_dir / "proxy_autostart.pyw"
-    log_path = str(config_dir / "proxy.log")
-    path.write_text(
-        f'''"""reqslim proxy logon entry -- run with pythonw.exe (no console)."""
-import os
-import sys
-import time
-import traceback
 
-MODULE_DIR = r"{module_dir}"
-LOG_PATH = r"{log_path}"
+    LIMIT = 5 * 1024 * 1024
 
+    def __init__(self, path):
+        self.path = path
+        self.count = 0
+        self.handle = open(path, "a", buffering=1, encoding="utf-8")
 
-def _rotate() -> None:
-    try:
-        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 1024 * 1024:
-            os.replace(LOG_PATH, LOG_PATH + ".1")
-    except OSError:
-        pass
+    def write(self, text):
+        self.count += len(text)
+        if self.count > self.LIMIT:
+            self.handle.close()
+            try:
+                os.replace(self.path, self.path + ".1")
+            except OSError:
+                pass
+            self.handle = open(self.path, "a", buffering=1, encoding="utf-8")
+            self.count = 0
+        self.handle.write(text)
+
+    def flush(self):
+        try:
+            self.handle.flush()
+        except OSError:
+            pass
 
 
 def _run() -> int:
-    _rotate()
-    log = open(LOG_PATH, "a", buffering=1, encoding="utf-8")
+    log = _Log(LOG_PATH)
     sys.stdout = log
     sys.stderr = log
-    log.write(f"[{{time.strftime('%Y-%m-%d %H:%M:%S')}}] reqslim proxy starting\\n")
+    log.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] reqslim proxy starting\\n")
     sys.path.insert(0, MODULE_DIR)
     from reqslim.zcode.__main__ import main
     return main(["--autostart"])
@@ -209,9 +219,30 @@ if __name__ == "__main__":
             traceback.print_exc(file=_handle)
         _code = 1
     raise SystemExit(_code or 0)
-''',
-        encoding="utf-8",
-    )
+'''
+
+
+def write_autostart_pyw(config_dir: Path, module_dir: Path) -> Path:
+    """The windowless proxy entry, launched by pythonw at logon.
+
+    pythonw has no stdout, so every diagnostic would vanish silently; the
+    first thing this wrapper does is redirect both streams into a rotating
+    proxy.log. Import goes through an explicit sys.path entry rather than
+    PYTHONPATH: the shortcut passes no environment, and the module dir is
+    the one thing this file knows for certain.
+    """
+    path = config_dir / "proxy_autostart.pyw"
+    log_path = str(config_dir / "proxy.log")
+    header = f'''"""reqslim proxy logon entry -- run with pythonw.exe (no console)."""
+import os
+import sys
+import time
+import traceback
+
+MODULE_DIR = r"{module_dir}"
+LOG_PATH = r"{log_path}"
+'''
+    path.write_text(header + _PYW_BODY, encoding="utf-8")
     return path
 
 
@@ -433,7 +464,6 @@ def write_posix_launcher(
     module_dir: Path, exe: Path | None, listeners: list[tuple[int, str]]
 ) -> Path:
     launcher = module_dir / "start-zcode.sh"
-    start = f'"{exe}"' if exe else "open -a ZCode"
     listen_args = " ".join(f"--listen {port}={url}" for port, url in listeners)
     primary = listeners[0][0]
     body = f"""#!/usr/bin/env bash
@@ -470,7 +500,28 @@ if [ "$proxy_up" != true ]; then
   kill "$PROXY_PID" 2>/dev/null || true
   exit 1
 fi
-{start}
+
+# Start ZCode itself. macOS uses `open -a`; on Linux look for a binary next
+# to the launcher or on PATH (POSIX layouts are untested on real hardware).
+BIN=""
+OPEN_APP=false
+case "$(uname -s)" in
+  Darwin) OPEN_APP=true ;;
+  *)
+    for candidate in "$HERE/ZCode" "$HERE/zcode"; do
+      if [ -x "$candidate" ]; then BIN="$candidate"; break; fi
+    done
+    if [ -z "$BIN" ]; then BIN="$(command -v zcode 2>/dev/null || true)"; fi
+    ;;
+esac
+if [ "$OPEN_APP" = true ]; then
+  open -a ZCode
+elif [ -n "$BIN" ]; then
+  "$BIN"
+else
+  echo "could not locate the ZCode binary -- edit BIN= detection in this launcher." >&2
+  exit 1
+fi
 echo "ZCode launched through reqslim ({len(listeners)} listener(s), first port {primary})."
 echo "  stats  http://127.0.0.1:{primary}/v1/stats"
 """

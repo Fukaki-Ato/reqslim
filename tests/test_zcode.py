@@ -761,8 +761,8 @@ def test_l1_is_bounded_by_lru_not_cleared():
     for index in range(16390):
         proxy._store(f"k{index}", f"raw{index}", fp, message, b"{}", "http://x")
     assert len(proxy._l1) == 16384
-    assert ("http://x", "raw0") not in proxy._l1, "oldest entry must be evicted"
-    assert ("http://x", "raw16389") in proxy._l1, "newest entry must survive"
+    assert ("http://x", "", "raw0") not in proxy._l1, "oldest entry must be evicted"
+    assert ("http://x", "", "raw16389") in proxy._l1, "newest entry must survive"
 
 
 def test_oversized_body_is_rejected_without_reading():
@@ -976,6 +976,154 @@ def test_table_watcher_regenerates_on_change():
         os.unlink(source)
         assert watcher.tick() is False
         assert watcher.misses == 1
+
+
+# ------------------------------------------------- 0.2.1: remaining audit
+def test_beta_tag_normalization():
+    """Only the *set* of beta switches matters: order and spacing are client
+    churn, presence is semantics."""
+    from reqslim.zcode.normalize import beta_tag
+
+    assert beta_tag({}) == ""
+    assert beta_tag({"Anthropic-Beta": "  x  "}) == "x"
+    ordered = {"anthropic-beta": "b-feature,c-feature"}
+    shuffled = {"anthropic-beta": " c-feature , b-feature "}
+    assert beta_tag(ordered) == beta_tag(shuffled) == "b-feature,c-feature"
+    assert beta_tag({"anthropic-beta": "a,b"}) != beta_tag({"anthropic-beta": "a"})
+
+
+def test_fingerprint_includes_beta():
+    fp_a = fingerprint(_payload(), beta="feat-a")
+    fp_b = fingerprint(_payload(), beta="feat-b")
+    fp_a_again = fingerprint(_payload(), beta="feat-a")
+    assert fp_a.key != fp_b.key, "different beta switches change the answer"
+    assert fp_a.key == fp_a_again.key, "same inputs must digest identically"
+    assert fp_a.beta == "feat-a"
+
+
+def test_proxy_partitions_cache_by_beta_header():
+    """Two byte-identical requests under different beta switches must both
+    reach the upstream; a repeat under the same beta hits the raw cache."""
+    upstream = FakeUpstream()
+    proxy = ZCodeProxy(f"http://127.0.0.1:{upstream.port}")
+    server = proxy.serve(port=0)
+    try:
+        port = server.server_address[1]
+
+        def post_beta(beta):
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/v1/messages",
+                data=json.dumps(_payload()).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "anthropic-version": "2023-06-01",
+                    "anthropic-beta": beta,
+                },
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return response.read()
+
+        post_beta("feat-a")
+        post_beta("feat-b")
+        assert upstream.calls == 2, "different beta sets must not share a cache entry"
+        post_beta("feat-a")
+        assert upstream.calls == 2, "identical beta must hit the raw cache"
+        assert proxy.stats()["hits"] == {"raw": 1}
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_follower_coalesces_while_leader_is_slow():
+    """A leader streaming for a long time keeps followers coalesced: the
+    follower budget is a deadline, not the old fixed 3x180s count (which a
+    slow drip stream could outlast)."""
+    upstream = FakeUpstream(delay=2.0)
+    proxy = ZCodeProxy(f"http://127.0.0.1:{upstream.port}", coalesce_wait=60.0)
+    server = proxy.serve(port=0)
+    port = server.server_address[1]
+    outcomes = []
+
+    def worker():
+        try:
+            post(port, _payload())
+            outcomes.append(1)
+        except Exception:
+            outcomes.append(0)
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    try:
+        t1.start()
+        time.sleep(0.15)  # the first request becomes the leader
+        t2.start()
+        t1.join(30)
+        t2.join(30)
+        assert outcomes == [1, 1]
+        assert upstream.calls == 1, f"slow leader must keep coalescing: {upstream.calls}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_coalesce_budget_expiry_forwards():
+    """Past its deadline a follower forwards concurrently: progress wins over
+    deduplication (and both clients still get an answer)."""
+    upstream = FakeUpstream(delay=1.0)
+    proxy = ZCodeProxy(f"http://127.0.0.1:{upstream.port}", coalesce_wait=0.3)
+    server = proxy.serve(port=0)
+    port = server.server_address[1]
+    outcomes = []
+
+    def worker():
+        try:
+            post(port, _payload())
+            outcomes.append(1)
+        except Exception:
+            outcomes.append(0)
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    try:
+        t1.start()
+        time.sleep(0.15)
+        t2.start()
+        t1.join(30)
+        t2.join(30)
+        assert outcomes == [1, 1]
+        assert upstream.calls == 2, f"expired follower must forward: {upstream.calls}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_recorder_rotates_on_write_when_over_budget():
+    """The autostart proxy runs for weeks: rotation must happen on write, not
+    only at startup, or the JSONL grows without bound."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "requests.jsonl")
+        recorder = Recorder(path=path, max_bytes=700)
+        for _ in range(6):
+            recorder.add(Event(
+                ts=time.time(), key="k", short="k", tail="t", kind="tool_turn",
+                model="m", status=200, latency=0.01, est_tokens=100,
+                tokens_in=0, tokens_out=0, hit="", stream=False,
+                n_messages=1, tools=(),
+            ))
+        assert os.path.exists(path + ".1"), "over-budget log must rotate on write"
+        assert os.path.getsize(path) <= 700 + 900, "current file stays near budget"
+        recorder.add(Event(
+            ts=time.time(), key="after-rotation", short="a", tail="t",
+            kind="tool_turn", model="m", status=200, latency=0.01,
+            est_tokens=1, tokens_in=0, tokens_out=0, hit="", stream=False,
+            n_messages=1, tools=(),
+        ))
+        with open(path, encoding="utf-8") as handle:
+            assert '"after-rotation"' in handle.read(), \
+                "post-rotation events land in the fresh file"
 
 
 if __name__ == "__main__":

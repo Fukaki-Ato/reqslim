@@ -122,7 +122,7 @@ pip install -e .        # 提供 reqslim-zcode 命令
 ## 测试
 
 ```bash
-python -m pytest        # 38 个用例
+python -m pytest        # 44 个用例
 ```
 
 不装 pytest 也能跑，测试文件自带最小 runner：
@@ -146,7 +146,7 @@ reqslim/
     ├── proxy.py       代理主逻辑
     └── __main__.py    CLI
 tools/install_zcode.py 安装器（探测 + 改写 provider 表 + 注册自启）
-tests/test_zcode.py    38 个用例
+tests/test_zcode.py    44 个用例
 docs/                  ZCode 接入指南
 ```
 

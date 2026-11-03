@@ -56,24 +56,32 @@ class Recorder:
         max_events: int = 50_000,
     ) -> None:
         self.path = path
+        self.max_bytes = max_bytes
         self._lock = threading.Lock()
         #: Bounded on purpose. The JSONL is the durable record; the in-memory
         #: copy only has to cover a report's worth of recent traffic. Left
         #: unbounded, a proxy that stays up for weeks grows without limit
         #: (~200 bytes per event, and the file rotation never touches memory).
         self.events: deque[Event] = deque(maxlen=max_events)
+        #: Bytes written to the current file since its last rotation. The
+        #: proxy autostarts at logon and may run for weeks, so rotation has
+        #: to happen on write -- waiting for a restart is not an option.
+        self._counter = 0
         if path:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             self._rotate(path, max_bytes)
+            try:
+                self._counter = os.path.getsize(path)
+            except OSError:
+                self._counter = 0
 
     @staticmethod
     def _rotate(path: str, max_bytes: int) -> None:
         """Keep one previous log and start a fresh file.
 
-        The proxy is meant to stay up for weeks, so an unbounded append-only
-        file is a slow leak: it eventually costs minutes in ``--report`` and
-        hundreds of MB on disk. Rotating at startup (never mid-session) keeps
-        one run's events together and its report coherent.
+        Rotation fires at startup and on write (once the byte counter crosses
+        ``max_bytes``): one previous log is enough to diff against and small
+        on disk, while ``--report`` keeps reading the current file.
         """
         if not max_bytes:
             return
@@ -85,12 +93,17 @@ class Recorder:
             pass  # logging must never prevent the proxy from starting
 
     def add(self, event: Event) -> None:
+        blob = event.to_json() + "\n"
         with self._lock:
             self.events.append(event)
             if self.path:
                 try:
+                    if self.max_bytes and self._counter + len(blob) > self.max_bytes:
+                        self._rotate(self.path, self.max_bytes)
+                        self._counter = 0
                     with open(self.path, "a", encoding="utf-8") as handle:
-                        handle.write(event.to_json() + "\n")
+                        handle.write(blob)
+                    self._counter += len(blob)
                 except OSError:
                     self.path = None  # never let logging break the proxy
 

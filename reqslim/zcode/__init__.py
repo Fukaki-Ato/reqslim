@@ -18,6 +18,7 @@ from __future__ import annotations
 from .analytics import Event, Recorder, load_events
 from .normalize import (
     Fingerprint,
+    beta_tag,
     classify,
     fingerprint,
     normalize_request,
@@ -33,6 +34,7 @@ __all__ = [
     "Fingerprint",
     "Recorder",
     "ZCodeProxy",
+    "beta_tag",
     "classify",
     "fingerprint",
     "has_thinking",

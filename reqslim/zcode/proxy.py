@@ -50,7 +50,7 @@ from typing import Any
 from ..cache import ExactCache
 from ..types import LLMResponse
 from .analytics import Event, Recorder
-from .normalize import fingerprint
+from .normalize import beta_tag, fingerprint
 from .stream import Assembler, replay_sse, tool_uses, usable
 
 HOP_BY_HOP = {
@@ -81,6 +81,7 @@ class ZCodeProxy:
         cache_bytes: int = 128 * 1024 * 1024,
         cache_enabled: bool = True,
         coalesce: bool = True,
+        coalesce_wait: float = 600.0,
         failure_ttl: float = 20.0,
         record_path: str | None = None,
         timeout: float = 300.0,
@@ -90,6 +91,7 @@ class ZCodeProxy:
         self.cache = ExactCache(maxsize=max_cache, ttl=ttl, max_bytes=cache_bytes)
         self.cache_enabled = cache_enabled
         self.coalesce = coalesce
+        self.coalesce_wait = coalesce_wait
         self.failure_ttl = failure_ttl
         self.max_cache_bytes = max_cache_bytes
         self.timeout = timeout
@@ -97,7 +99,10 @@ class ZCodeProxy:
         self.recorder = Recorder(record_path)
 
         self._lock = threading.Lock()
-        self._l1: OrderedDict[tuple[str, str], tuple[str, Any]] = OrderedDict()
+        #: (upstream, beta_tag, raw_hash) -> (key, fingerprint). L1 maps a
+        #: byte-identical repeat to its cache key; beta participates because
+        #: identical bytes under different beta switches may answer differently.
+        self._l1: OrderedDict[tuple[str, str, str], tuple[str, Any]] = OrderedDict()
         self._inflight: dict[str, threading.Event] = {}
         self._failures: dict[str, tuple[float, int, bytes]] = {}
         #: port -> upstream URL, filled in by serve/serve_many
@@ -256,27 +261,37 @@ class ZCodeProxy:
         streaming = bool(payload.get("stream"))
         suffix = "/v1/messages" if path.endswith("/v1/messages") else "/messages"
         raw_hash = hashlib.sha256(raw).hexdigest()
+        beta = beta_tag(headers)
 
         # Cache scopes are per upstream: the same logical request to two
         # gateways is two different conversations as far as replay is concerned.
+        # Beta joins both scopes: identical bytes under a different beta switch
+        # may legitimately answer differently.
         with self._lock:
-            known = self._l1.get((upstream, raw_hash))
+            known = self._l1.get((upstream, beta, raw_hash))
             if known is not None:
                 # A repeat is exactly the entry worth keeping under memory
                 # pressure; eviction below must see it as recently used.
-                self._l1.move_to_end((upstream, raw_hash))
+                self._l1.move_to_end((upstream, beta, raw_hash))
         # A raw-hash hit means these exact bytes were answered before, so the
         # saving belongs to the cheapest mechanism. Reporting it as
         # "normalized" would hide whether the raw path ever fires.
         level = "normalized" if known is None else "raw"
         if known is None:
-            fp = fingerprint(payload)
-            key = f"{upstream}|{fp.key}"
+            fp = fingerprint(payload, beta)
+            key = f"{upstream}|{beta}|{fp.key}"
         else:
             key, fp = known
 
         is_leader = False
-        for _ in range(3):
+        # Follower budget: a deadline, not a retry count. The old fixed
+        # 3x180s starved coalescing exactly where it matters -- slow long
+        # streams (the socket timeout bounds per-read gaps, not total
+        # duration, so a drip stream can legitimately run far longer).
+        # Past the deadline a follower forwards concurrently: progress wins
+        # over deduplication.
+        deadline = time.time() + self.coalesce_wait if self.coalesce_wait > 0 else None
+        while True:
             hit = self._cache_get(key)
             if hit is not None:
                 # ``billed=False``: the tokens were paid for when this answer
@@ -299,8 +314,11 @@ class ZCodeProxy:
             if leader:
                 is_leader = True
                 break
-            event.wait(timeout=180)
-            # leader finished: loop and re-check the cache
+            remaining = None if deadline is None else deadline - time.time()
+            if remaining is not None and remaining <= 0:
+                break
+            event.wait(timeout=30 if remaining is None else min(30.0, remaining))
+            # leader finished (or the 30s tick): loop and re-check the cache
 
         try:
             if streaming:
@@ -487,8 +505,8 @@ class ZCodeProxy:
         if not self.cache_enabled or len(raw) > self.max_cache_bytes or not usable(message):
             return
         with self._lock:
-            self._l1[(upstream, raw_hash)] = (key, fp)
-            self._l1.move_to_end((upstream, raw_hash))
+            self._l1[(upstream, fp.beta, raw_hash)] = (key, fp)
+            self._l1.move_to_end((upstream, fp.beta, raw_hash))
             # LRU eviction, not a wipe: clearing the whole map would drop the
             # raw attribution for every still-hot key at once.
             while len(self._l1) > 16384:

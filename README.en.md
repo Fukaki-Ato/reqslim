@@ -122,7 +122,7 @@ Requires **Python 3.9+** (declared in `requires-python`; CI covers 3.9 / 3.11 / 
 ## Tests
 
 ```bash
-python -m pytest        # 38 cases
+python -m pytest        # 44 cases
 ```
 
 pytest not required — the test file ships a minimal runner:
@@ -146,7 +146,7 @@ reqslim/
     ├── proxy.py       proxy core
     └── __main__.py    CLI
 tools/install_zcode.py installer (probe + rewrite provider table + register autostart)
-tests/test_zcode.py    38 cases
+tests/test_zcode.py    44 cases
 docs/                  ZCode integration guides (Chinese)
 ```
 
