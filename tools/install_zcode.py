@@ -52,6 +52,8 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -275,6 +277,44 @@ def install_autostart_windows(
         print(f"env         FAILED to set user environment variable ({detail})")
         print("            ZCode will still route through reqslim when started via start-zcode.bat")
     return (lnk_created or lnk), lnk_created
+
+
+def start_proxy_now(python_exe: str, pyw: Path, module_dir: Path, port: int) -> bool:
+    """Launch the proxy immediately, so "install, then open ZCode" works
+    without waiting for the next logon.
+
+    The Startup shortcut only fires at the next logon; without this, a fresh
+    install leaves every ZCode request hitting a dead port until reboot.
+    Idempotent by design: if an equivalent proxy already serves, the spawned
+    process detects it and exits 0 on its own. Returns whether the primary
+    port answers ``/v1/health`` afterwards.
+    """
+    pythonw = Path(python_exe).with_name("pythonw.exe")
+    if not pythonw.exists():
+        pythonw = Path(python_exe)
+    flags = 0
+    if os.name == "nt":
+        flags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+    subprocess.Popen(
+        [str(pythonw), str(pyw)],
+        cwd=str(module_dir),
+        creationflags=flags,
+        close_fds=True,
+    )
+    for _ in range(10):
+        time.sleep(1)
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/v1/health", timeout=2
+            ) as response:
+                if json.loads(response.read() or b"{}").get("ok") is True:
+                    return True
+        except Exception:  # noqa: BLE001 - not up yet; keep polling
+            continue
+    return False
 
 
 def uninstall(config_dir: Path) -> int:
@@ -562,11 +602,17 @@ def main(argv: list[str] | None = None) -> int:
             print("watch       proxy rewrites the provider table within a minute of ZCode updates")
         else:
             print("autostart   incomplete -- start-zcode.bat remains the working path")
+        # Start it now: the logon entry would otherwise leave every ZCode
+        # request on a dead port until the next reboot.
+        if start_proxy_now(sys.executable, config_dir / "proxy_autostart.pyw", module_dir, args.port):
+            print(f"proxy       serving on http://127.0.0.1:{args.port} -- you can open ZCode now")
+        else:
+            print("proxy       did not come up -- see proxy.log in the config dir")
     elif os.name == "nt":
         print("autostart   skipped (--no-autostart); use start-zcode.bat to launch")
     else:
         print("autostart   not configured on this OS; add start-zcode.sh to your session's startup")
-    print(f"\nZCode now routes through reqslim on its next start. "
+    print(f"\nZCode routes through reqslim on its next start. "
           f"Open http://127.0.0.1:{args.port}/v1/stats to watch traffic.")
     return 0
 

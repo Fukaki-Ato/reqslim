@@ -53,9 +53,9 @@ cd reqslim
 python tools/install_zcode.py
 ```
 
-需要 Python 3.9+（仅标准库，无需 pip install；CI 覆盖 3.9 / 3.11 / 3.13 × Windows / Linux）。
+需要 Python 3.9+（仅标准库，无需 pip install；CI 覆盖 3.9 / 3.11 / 3.13 × Windows / Linux）。没有 `python` 命令时双击 `setup.bat`，它会自动探测可用的解释器。请用 `git clone` 获取代码，**不要用 Download ZIP**（zip 内 `.bat` 是 LF 换行，个别 cmd 场景会出错）。
 
-安装器会探测 ZCode 安装位置、复制 provider 表并把 `baseUrl` 指向本地代理，然后配置**开机自动装载**（Windows）：
+安装器会探测 ZCode 安装位置、复制 provider 表并把 `baseUrl` 指向本地代理，然后配置**开机自动装载**（Windows）——**装完代理就已启动**，不用重启：
 
 - 代理注册到启动文件夹，登录即运行，`pythonw` 无窗口，日志在 `%USERPROFILE%\.zcode\reqslim\proxy.log`；
 - `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 设为用户级环境变量 —— 之后 ZCode 无论从任务栏、开始菜单还是别的工具启动，都自动走代理，**不需要再点任何 bat**；

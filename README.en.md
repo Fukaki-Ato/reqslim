@@ -53,9 +53,9 @@ cd reqslim
 python tools/install_zcode.py
 ```
 
-Requires Python 3.9+ (standard library only, no pip install needed; CI covers 3.9 / 3.11 / 3.13 × Windows / Linux).
+Requires Python 3.9+ (standard library only, no pip install needed; CI covers 3.9 / 3.11 / 3.13 × Windows / Linux). If the `python` command is missing, run `setup.bat` — it probes for an available interpreter. Use `git clone`; **do not use Download ZIP** (the `.bat` files inside are LF-normalized and some cmd.exe constructs misbehave on LF).
 
-The installer locates the ZCode install, copies the provider table, points its `baseUrl`s at the local proxy, and sets up **logon autoload** (Windows):
+The installer locates the ZCode install, copies the provider table, points its `baseUrl`s at the local proxy, and sets up **logon autoload** (Windows) — **the proxy is already running when the installer finishes**, no reboot needed:
 
 - the proxy is registered in the Startup folder and runs at logon via `pythonw` — no console window; logs at `%USERPROFILE%\.zcode\reqslim\proxy.log`;
 - `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` is set as a user-level environment variable — ZCode then routes through the proxy no matter how it is started (taskbar, Start menu, other tools). **No launcher to click, ever**;
