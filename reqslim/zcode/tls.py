@@ -88,6 +88,35 @@ def _write_bundle(ca: Path, bundle: Path) -> None:
     os.replace(tmp, bundle)
 
 
+def _valid_tls(files: TlsFiles) -> bool:
+    try:
+        server_context = make_context(files.cert, files.key)
+        client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        client_context.load_verify_locations(cafile=str(files.ca))
+        server_in, server_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+        client_in, client_out = ssl.MemoryBIO(), ssl.MemoryBIO()
+        server = server_context.wrap_bio(server_in, server_out, server_side=True)
+        client = client_context.wrap_bio(client_in, client_out, server_hostname="127.0.0.1")
+        done = [False, False]
+        for _ in range(12):
+            for index, connection in enumerate((client, server)):
+                if not done[index]:
+                    try:
+                        connection.do_handshake()
+                        done[index] = True
+                    except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                        pass
+            if client_out.pending:
+                server_in.write(client_out.read())
+            if server_out.pending:
+                client_in.write(server_out.read())
+            if all(done):
+                return True
+    except (OSError, ValueError):
+        return False
+    return False
+
+
 def ensure_tls(config_dir: Path, *, force: bool = False) -> TlsFiles:
     """Create (or reuse) the private CA and server certificate.
 
@@ -103,9 +132,8 @@ def ensure_tls(config_dir: Path, *, force: bool = False) -> TlsFiles:
         cert=tls_dir / "server.crt",
         key=tls_dir / "server.key",
     )
-    if not force and all(path.is_file() for path in (files.ca, files.cert, files.key)):
-        if not files.bundle.is_file():
-            _write_bundle(files.ca, files.bundle)
+    if not force and _valid_tls(files):
+        _write_bundle(files.ca, files.bundle)
         return files
 
     openssl = _openssl()
@@ -206,6 +234,8 @@ def ensure_tls(config_dir: Path, *, force: bool = False) -> TlsFiles:
             os.chmod(private, 0o600)
         except OSError:
             pass
+    if not _valid_tls(files):
+        raise RuntimeError("the generated TLS certificate or key is invalid")
     return files
 
 

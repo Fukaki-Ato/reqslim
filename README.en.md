@@ -35,7 +35,7 @@ fail with `ClientRequestSigningV4Error`.
 Four paths are tried in order; only if all miss is the request forwarded:
 
 1. **Raw byte hash** — identical request bodies are settled by a single sha256, the cheapest possible check
-2. **Normalized key** — strips the three things that churn every turn without changing meaning (below)
+2. **Normalized key**: removes cache-breakpoint and tool-order drift and consistently renames tool IDs while preserving their references
 3. **In-flight coalescing** — the same request arriving while a previous one is still running waits for it instead of hitting the upstream again
 4. **Failure memo** — when the upstream returns 429/5xx the request is remembered; identical retries within 20 seconds get the error replayed
 
@@ -43,7 +43,7 @@ Four paths are tried in order; only if all miss is the request forwarded:
 
 ## Three key decisions
 
-**Normalization strips exactly three things.** `cache_control` breakpoints, `tool_use.id`, and `tools` array order — all three churn every turn with no semantic change, and without stripping them the hit rate is near zero. Everything else stays in the cache key: text, file contents, tool inputs, thinking budgets — because they genuinely change the answer.
+**Normalization preserves references.** It ignores `cache_control` breakpoints and `tools` array order, and consistently renames `tool_use.id` and `tool_result.tool_use_id` instead of deleting their relationship. Swapping the ownership of parallel tool results produces a different cache key. Text, file contents, tool inputs, and thinking budgets stay in the key because they change the answer.
 
 **Stream assembly preserves `thinking` + `signature` verbatim.** Lose the signature and the upstream rejects the session several turns later — the symptom is far from the cause, the hardest class of bug to trace. The assembler handles every block type Anthropic actually emits: `text`, `thinking`, `redacted_thinking`, `tool_use`.
 
@@ -100,9 +100,13 @@ To set reqslim up on another machine's ZCode, there is a step-by-step runbook an
 
 The installer **never touches** the ZCode install directory, **never touches** ZCode user settings, and **never touches** credentials. It sets two user-level environment variables (`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`, `ZCODE_AGENT_CA_CERT`) and rewrites the provider/runtime cache tables (backups kept; `--uninstall` stops the proxy and restores them).
 
+Existing user-level environment values are saved and restored on uninstall; values changed independently after installation are preserved. If a runtime cache cannot be restored, uninstall returns a nonzero status and keeps the recovery configuration and certificates. `--uninstall --dry-run` only previews changes and does not stop the proxy or modify files or environment variables.
+
+Runtime caches keep `*.reqslim-state.json` ownership records alongside `.bak-reqslim` backups. These retain each provider's latest original upstream, so port changes and uninstall preserve later providers, metadata, and user proxy changes. Keep both recovery artifacts. Installation persists a recovery snapshot before changing user environment values and retains current configuration, certificates, and environment backups until restoration is confirmed.
+
 ### Multiple upstreams
 
-API-key templates and plan accounts often live on **different gateways** (e.g. `open.bigmodel.cn` vs `zcode.z.ai`). Each gateway gets its own local port inside the same proxy process and the same report; cache, coalescing and the failure memo are partitioned per upstream — replaying gateway A's cached answer to a gateway B request would break the "unmount and nothing changes" guarantee.
+API-key templates and plan accounts often live on **different gateways** (e.g. `open.bigmodel.cn` vs `zcode.z.ai`). Each gateway gets its own local port inside the same proxy process and report. Cache, coalescing, and the failure memo are partitioned by gateway, endpoint/query, credentials, and beta/version. Signing handshakes also use the current listener's gateway.
 
 ```bash
 python tools/install_zcode.py \
@@ -175,14 +179,19 @@ Requires **Python 3.9+** (declared in `requires-python`; CI covers 3.9 / 3.11 / 
 ## Tests
 
 ```bash
-python -m pytest        # 80 cases
+python -m pytest
 ```
 
 pytest not required — the test file ships a minimal runner:
 
 ```bash
-python tests/test_zcode.py
+python -I tests/test_zcode.py
+python -I -m unittest discover -s tests -p "test_*regressions.py" -v
 ```
+
+The script runner fails on unhandled background-thread exceptions. Network tests should use `proxy.close()` for teardown: `server_close()` alone does not stop `serve_forever` and can produce asynchronous socket errors on Windows.
+
+Single-flight regressions combine disabled caching, immediate eviction, and oversized requests, including a frozen clock. Handoff eligibility uses publication generations observed when a request begins, not timestamp resolution, and never turns old handoffs into an implicit cache.
 
 ---
 
@@ -201,7 +210,8 @@ reqslim/
     ├── tls.py         local HTTPS certificate and CA bundle
     └── __main__.py    CLI
 tools/install_zcode.py installer (probe + rewrite provider tables/caches + register autostart)
-tests/test_zcode.py    80 cases
+tests/test_zcode.py    original integration tests
+tests/test_*regressions.py  cache, protocol, and installation recovery tests
 docs/                  ZCode integration guides (Chinese)
 ```
 
@@ -225,7 +235,7 @@ Priority order; conflicts resolve in favor of the top:
 - Listens on `127.0.0.1` only, so the LAN cannot reach it.
 - `Authorization` and other credentials are forwarded with the request and never written to disk.
 - `requests.jsonl` records hashes, status, latency, token counts, tool names, and hit attribution — never prompt or response bodies.
-- The private CA key lives under `%USERPROFILE%\.zcode\reqslim\tls\`; `--uninstall` removes the certificate directory and the related environment variable.
+- The private CA key lives under `%USERPROFILE%\.zcode\reqslim\tls\`; a successful uninstall removes the certificate directory and restores the previous CA environment setting.
 
 ## Known limitations
 
@@ -237,7 +247,7 @@ Priority order; conflicts resolve in favor of the top:
 - **Single process, single instance** — a second instance on the same port fails loudly. Windows' default `SO_REUSEADDR` would let it silently steal traffic, so it is deliberately disabled.
 - **Upgrades/port changes restart the proxy** — the installer and `--autostart` stop the old instance before rebasing runtime caches; a 0.2.2 instance has no `/v1/shutdown`, so stop it manually or reboot once.
 - **Runtime caches are read-only** — this stops ZCode's cloud refresher from overwriting the local table at startup; `EPERM` / "Builtin 远端更新失败，继续使用本地配置" in ZCode logs is expected. Re-run the installer or `--uninstall` to handle the flag.
-- **The loopback HTTPS listener uses a private CA** — its certificate covers only `127.0.0.1` / `localhost` and is exposed to ZCode through `ZCODE_AGENT_CA_CERT`; browsers or curl checking the report page need `-k`. `--uninstall` removes the certificate directory and the environment variable.
+- **The loopback HTTPS listener uses a private CA**: its certificate covers only `127.0.0.1` / `localhost` and is exposed to ZCode through `ZCODE_AGENT_CA_CERT`; browsers or curl checking the report page need `-k`. A successful uninstall removes the certificate directory and restores the previous CA environment setting.
 - **macOS / Linux paths are untested on real hardware** — the development machine is Windows.
 
 ## License

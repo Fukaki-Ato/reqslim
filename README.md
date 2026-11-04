@@ -31,7 +31,7 @@ ZCode 3.17 的套餐账号会启用客户端请求签名，签名层**拒绝 HTT
 四条路径按顺序试，全部未命中才转发：
 
 1. **原始字节哈希** —— 一模一样的请求体，一个 sha256 就能判定，成本最低
-2. **规范化键** —— 剥掉每轮都变但语义不变的三样东西（见下）
+2. **规范化键**：消除缓存断点、工具 ID 命名和工具数组顺序的漂移，同时保留工具调用与结果的引用关系
 3. **单飞合并** —— 同一请求上一个还没结束时又来一次，后到的等前一个，不重复打上游
 4. **失败记忆** —— 上游 429/5xx 时按请求记下，20 秒内相同重试直接回放该错误
 
@@ -39,7 +39,7 @@ ZCode 3.17 的套餐账号会启用客户端请求签名，签名层**拒绝 HTT
 
 ## 三个关键点
 
-**规范化只剥离三样。** `cache_control` 断点、`tool_use.id`、`tools` 数组顺序 —— 这三样每轮都变但语义不变，不剥离的话命中率接近零。除此之外全部保留在缓存键里：文本、文件内容、工具入参、thinking 预算，因为它们确实会改变回答。
+**规范化保留引用关系。** 忽略 `cache_control` 断点和 `tools` 数组顺序，对 `tool_use.id` 与 `tool_result.tool_use_id` 做一致的稳定重命名，而不是删除引用。交换两个并行工具结果的归属会产生不同的缓存键。文本、文件内容、工具入参、thinking 预算也全部保留，因为它们确实会改变回答。
 
 **流装配逐字保留 `thinking` + `signature`。** 丢了签名上游会在几轮之后才拒绝会话，症状离病因很远，是最难查的那类 bug。装配器处理 Anthropic 实际会发的每种块：`text`、`thinking`、`redacted_thinking`、`tool_use`。
 
@@ -94,9 +94,13 @@ python tools/install_zcode.py --uninstall   # 先停代理，再移除自启项/
 
 安装器**不改** ZCode 安装目录、**不改** ZCode 用户设置、**不碰**登录凭据；它会设置两个用户级环境变量（provider 表、本地 CA），并改写 provider 表与运行时缓存表（均有备份，`--uninstall` 自动停代理并还原）。
 
+安装前已有的用户级环境变量会被保存，卸载时恢复；用户在安装后自行修改的值不会被覆盖。运行时缓存还原失败时，卸载返回非零并保留配置和证书供重试。`--uninstall --dry-run` 只预览，不停代理也不修改文件或环境变量。
+
+运行时缓存旁的 `*.reqslim-state.json` 保存最新 provider 原上游与本工具监听的归属，换端口和卸载时会保留后来新增的 provider、元数据及用户代理修改。请将这些归属文件与 `.bak-reqslim` 一并保留。安装修改用户环境前会持久化恢复快照；原环境恢复未确认时，不会删除当前配置、证书或环境备份。
+
 ### 多上游
 
-API key 模板和套餐账号常落在**不同网关**（如 `open.bigmodel.cn` 与 `zcode.z.ai`）。每个网关分一个本地端口，同一代理进程、同一份报告；缓存、单飞、失败记忆按**网关 + 凭据 + beta/version**分区 —— 拿 A 网关或 A 账号的缓存回放给 B 的请求，就违背了「摘掉后行为不变」的承诺。
+API key 模板和套餐账号常落在**不同网关**（如 `open.bigmodel.cn` 与 `zcode.z.ai`）。每个网关分一个本地端口，同一代理进程、同一份报告；缓存、单飞、失败记忆按**网关 + 端点/query + 凭据 + beta/version**分区。签名握手也按当前监听器转发到对应网关，不跨网关共享。
 
 ```bash
 python tools/install_zcode.py \
@@ -165,14 +169,19 @@ pip install -e .        # 提供 reqslim-zcode 命令
 ## 测试
 
 ```bash
-python -m pytest        # 80 个用例
+python -m pytest
 ```
 
 不装 pytest 也能跑，测试文件自带最小 runner：
 
 ```bash
-python tests/test_zcode.py
+python -I tests/test_zcode.py
+python -I -m unittest discover -s tests -p "test_*regressions.py" -v
 ```
+
+脚本 runner 会将未处理的后台线程异常计为失败。网络测试清理监听器时使用 `proxy.close()`，不要只调用 `server_close()`；后者不会停止 `serve_forever` 循环，Windows 下会产生异步 socket 异常。
+
+单飞回归组合覆盖禁缓存、立即淘汰和请求超限，并固定时钟验证交接：是否可共享由请求开始时观察的发布代次判断，不依赖时间戳分辨率，也不把旧 handoff 当成隐式缓存。
 
 ---
 
@@ -191,7 +200,8 @@ reqslim/
     ├── tls.py         本机 HTTPS 证书与 CA bundle
     └── __main__.py    CLI
 tools/install_zcode.py 安装器（探测 + 改写 provider 表/缓存表 + 注册自启）
-tests/test_zcode.py    80 个用例
+tests/test_zcode.py    原有集成测试
+tests/test_*regressions.py  缓存、协议与安装恢复回归测试
 docs/                  ZCode 接入指南
 ```
 
@@ -215,7 +225,7 @@ docs/                  ZCode 接入指南
 - 默认只监听 `127.0.0.1`，局域网无法访问。
 - `Authorization` 等凭据只随请求转发，不写入磁盘。
 - `requests.jsonl` 只记录哈希、状态、延迟、token 计数、工具名和命中归因，不记录 prompt / 响应正文。
-- 本机 CA 私钥在 `%USERPROFILE%\.zcode\reqslim\tls\`；`--uninstall` 会删除证书目录和对应环境变量。
+- 本机 CA 私钥在 `%USERPROFILE%\.zcode\reqslim\tls\`；成功卸载后删除证书目录，并恢复安装前的 CA 环境配置。
 
 ## 已知限制
 
@@ -227,7 +237,7 @@ docs/                  ZCode 接入指南
 - **单进程单实例** —— 同一端口开第二个会直接报错退出。Windows 默认的 `SO_REUSEADDR` 会让它静默抢流量，所以特意关掉了。
 - **升级/换端口会重启代理** —— 安装器/`--autostart` 会先停掉旧实例，再按新 mapping 改写运行时缓存；0.2.2 旧实例没有 `/v1/shutdown`，需先手动结束或重启一次。
 - **运行时缓存被设为只读** —— 阻止 ZCode 云刷新在启动窗口覆盖本地表；ZCode 日志中的 `EPERM` / `Builtin 远端更新失败，继续使用本地配置` 属预期，重跑安装器或 `--uninstall` 会处理只读标记。
-- **本机 HTTPS 使用私有 CA** —— 证书只含 `127.0.0.1` / `localhost`，通过 `ZCODE_AGENT_CA_CERT` 提供给 ZCode；浏览器或 curl 直接访问报告页需要 `-k`。`--uninstall` 会删除证书目录和该环境变量。
+- **本机 HTTPS 使用私有 CA**：证书只含 `127.0.0.1` / `localhost`，通过 `ZCODE_AGENT_CA_CERT` 提供给 ZCode；浏览器或 curl 直接访问报告页需要 `-k`。成功卸载会删除证书目录并恢复原有 CA 环境配置。
 - **macOS / Linux 路径未经实机验证** —— 开发机是 Windows。
 
 ## License

@@ -21,3 +21,4 @@ jobs:
       # The suite is self-contained: it boots real loopback HTTP servers and
       # needs no pytest or any third-party package.
       - run: python -I tests/test_zcode.py
+      - run: python -I -m unittest discover -s tests -p "test_*regressions.py" -v

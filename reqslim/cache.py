@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import OrderedDict
+from copy import deepcopy
 
 from .types import LLMResponse
 
@@ -55,13 +56,16 @@ class ExactCache:
             self.misses += 1
         return None
 
-    def put(self, key: str, response: LLMResponse) -> None:
-        size = len(response.content.encode("utf-8"))
+    def put(self, key: str, response: LLMResponse) -> bool:
+        stored = deepcopy(response)
+        size = len(stored.content.encode("utf-8"))
         with self._lock:
             old = self._data.pop(key, None)
             if old is not None:
                 self._bytes -= old[2]
-            self._data[key] = (time.time(), response, size)
+            if self.ttl is not None and self.ttl <= 0:
+                return False
+            self._data[key] = (time.time(), stored, size)
             self._bytes += size
             self._data.move_to_end(key)
             while self._data and (
@@ -70,6 +74,7 @@ class ExactCache:
             ):
                 _, entry = self._data.popitem(last=False)
                 self._bytes -= entry[2]
+            return key in self._data
 
     def size(self) -> int:
         """Entry count, so callers do not have to reach into ``_data``."""
@@ -78,11 +83,7 @@ class ExactCache:
 
 
 def _as_hit(response: LLMResponse) -> LLMResponse:
-    return LLMResponse(
-        content=response.content,
-        raw=response.raw,
-        usage=response.usage,
-        cached=True,
-        source="exact_cache",
-        meta=dict(response.meta),
-    )
+    hit = deepcopy(response)
+    hit.cached = True
+    hit.source = "exact_cache"
+    return hit

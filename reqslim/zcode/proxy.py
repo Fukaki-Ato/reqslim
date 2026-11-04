@@ -44,13 +44,14 @@ import hashlib
 import http.client
 import json
 import os
+import ssl
 import threading
 import time
 import urllib.error
 import urllib.request
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple
 from urllib.parse import urlsplit
 
 from .. import __version__
@@ -106,8 +107,9 @@ MESSAGE_SUFFIXES = (
 
 def message_suffix(path: str) -> str | None:
     """Return the upstream path for a supported Anthropic endpoint."""
+    route = path.split("?", 1)[0].rstrip("/")
     for suffix in MESSAGE_SUFFIXES:
-        if path.endswith(suffix):
+        if route.endswith(suffix):
             return suffix
     return None
 
@@ -136,6 +138,15 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
         return None
+
+
+class _Handoff(NamedTuple):
+    expiry: float
+    generation: int
+    status: int
+    body: bytes
+    headers: dict[str, str]
+    message: Any
 
 
 class ZCodeProxy:
@@ -170,14 +181,15 @@ class ZCodeProxy:
         )
 
         self._lock = threading.Lock()
-        #: (upstream, beta_tag, credential_scope, raw_hash) -> (key, fingerprint)
-        self._l1: OrderedDict[tuple[str, str, str, str], tuple[str, Any]] = OrderedDict()
+        self._close_lock = threading.Lock()
+        self._l1: OrderedDict[tuple[str, str, str, str, str], tuple[str, Any]] = OrderedDict()
         self._inflight: dict[str, threading.Event] = {}
         #: key -> (expiry, status, body, headers)
         self._failures: dict[str, tuple[float, int, bytes, dict[str, str]]] = {}
         #: Short-lived leader result for followers that waited, so a response
         #: too large to cache still serves the whole single-flight group.
-        self._handoff: OrderedDict[str, tuple[float, int, bytes, dict[str, str], Any]] = OrderedDict()
+        self._handoff: OrderedDict[str, _Handoff] = OrderedDict()
+        self._handoff_generation = 0
         self._handoff_bytes = 0
         self._handoff_limit = 32 * 1024 * 1024
         self._servers: list[ThreadingHTTPServer] = []
@@ -185,6 +197,22 @@ class ZCodeProxy:
         #: port -> upstream URL, filled in by serve/serve_many
         self.listeners: dict[int, str] = {}
         self.tls_enabled = False
+        self.ready = True
+        self.managed_shutdown = False
+        self.record_path = os.path.abspath(record_path) if record_path else None
+        self.watchers: dict[str, Any] | None = None
+
+    def runtime_settings(self) -> dict[str, Any]:
+        return {
+            "ttl": self.cache.ttl,
+            "max_cache": self.cache.maxsize,
+            "cache": self.cache_enabled,
+            "coalesce": self.coalesce,
+            "coalesce_wait": self.coalesce_wait,
+            "failure_ttl": self.failure_ttl,
+            "record": self.record_path,
+            "watchers": self.watchers,
+        }
 
     # ------------------------------------------------------------------ server
     def serve(
@@ -228,6 +256,12 @@ class ZCodeProxy:
             def log_message(self, fmt: str, *args: Any) -> None:
                 return
 
+            def handle(self) -> None:
+                try:
+                    super().handle()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError, ssl.SSLError):
+                    self.close_connection = True
+
             def do_GET(self) -> None:  # noqa: N802
                 path = self.path.split("?")[0].rstrip("/")
                 if path in {"/v1/stats", "/stats"}:
@@ -244,6 +278,8 @@ class ZCodeProxy:
                         200,
                         {
                             "ok": True,
+                            "ready": proxy.ready,
+                            "version": __version__,
                             "pid": os.getpid(),
                             "upstream": proxy.upstream,
                             "upstreams": {
@@ -253,6 +289,7 @@ class ZCodeProxy:
                             "cache": proxy.cache_enabled,
                             "coalesce": proxy.coalesce,
                             "tls": proxy.tls_enabled,
+                            "settings": proxy.runtime_settings(),
                         },
                     )
                 elif path.startswith("/api/"):
@@ -300,7 +337,7 @@ class ZCodeProxy:
                     self._json(400, {"error": "request body must be a JSON object"})
                     return
                 try:
-                    proxy.handle(self, payload, raw, dict(self.headers.items()), path)
+                    proxy.handle(self, payload, raw, dict(self.headers.items()), self.path)
                 except (BrokenPipeError, ConnectionResetError):
                     self.close_connection = True
 
@@ -395,6 +432,22 @@ class ZCodeProxy:
             # restart while the old socket is in TIME_WAIT.
             allow_reuse_address = os.name != "nt"
 
+            def finish_request(self, request: Any, client_address: Any) -> None:
+                if context is None:
+                    super().finish_request(request, client_address)
+                    return
+                try:
+                    request.settimeout(min(proxy.timeout, 10.0))
+                    wrapped = context.wrap_socket(request, server_side=True)
+                except (OSError, ssl.SSLError):
+                    request.close()
+                    return
+                try:
+                    wrapped.settimeout(proxy.timeout)
+                    super().finish_request(wrapped, client_address)
+                finally:
+                    self.shutdown_request(wrapped)
+
         context = make_context(*tls) if tls else None
         self.tls_enabled = context is not None
         servers: list[ThreadingHTTPServer] = []
@@ -402,8 +455,6 @@ class ZCodeProxy:
             server: ThreadingHTTPServer | None = None
             try:
                 server = Server((host, port), Handler)
-                if context is not None:
-                    server.socket = context.wrap_socket(server.socket, server_side=True)
             except OSError as exc:
                 # A half-bound set would leave the caller with a proxy that
                 # answers on some ports and not others, which is harder to
@@ -429,7 +480,8 @@ class ZCodeProxy:
                 ) from exc
             server.upstream = upstream  # type: ignore[attr-defined]
             threading.Thread(
-                target=server.serve_forever, daemon=True, name=f"reqslim-zcode:{port}"
+                target=server.serve_forever, daemon=True,
+                name=f"reqslim-zcode:{server.server_address[1]}"
             ).start()
             servers.append(server)
         # Key by the actually-bound port: with port=0 the OS assigns and the
@@ -446,21 +498,24 @@ class ZCodeProxy:
         self.shutdown_event.set()
         # Also close without relying on a main loop. /v1/shutdown is used by
         # the uninstaller and by tests that embed the proxy directly.
-        threading.Thread(target=self._delayed_close, daemon=True).start()
+        if not self.managed_shutdown:
+            threading.Thread(target=self._delayed_close, daemon=True).start()
 
     def _delayed_close(self) -> None:
         time.sleep(0.05)
         self.close()
 
     def close(self) -> None:
-        servers, self._servers = self._servers, []
-        for server in servers:
-            try:
-                server.shutdown()
-            except Exception:  # noqa: BLE001 - best-effort teardown
-                pass
-            finally:
-                server.server_close()
+        with self._close_lock:
+            with self._lock:
+                servers, self._servers = self._servers, []
+            for server in servers:
+                try:
+                    server.shutdown()
+                except Exception:
+                    pass
+                finally:
+                    server.server_close()
 
     # ------------------------------------------------------------------- core
     def handle(
@@ -474,10 +529,15 @@ class ZCodeProxy:
         if not isinstance(payload, dict):
             self._send_error(handler, 400, "request body must be a JSON object")
             return
+        with self._lock:
+            observed_generation = self._handoff_generation
         started = time.time()
         upstream = getattr(handler.server, "upstream", None) or self.upstream
         streaming = bool(payload.get("stream"))
-        suffix = message_suffix(path) or "/v1/messages"
+        route, separator, query = path.partition("?")
+        suffix = message_suffix(route) or "/v1/messages"
+        if separator:
+            suffix += "?" + query
         raw_hash = hashlib.sha256(raw).hexdigest()
         beta = beta_tag(headers)
         scope = header_scope(headers)
@@ -485,7 +545,7 @@ class ZCodeProxy:
         # Cache scopes are per upstream, beta switch and credential. The same
         # logical request to two gateways or two accounts is not the same
         # conversation as far as replay is concerned.
-        l1_key = (upstream, beta, scope, raw_hash)
+        l1_key = (upstream, suffix, beta, scope, raw_hash)
         with self._lock:
             known = self._l1.get(l1_key)
             if known is not None:
@@ -497,10 +557,22 @@ class ZCodeProxy:
         # "normalized" would hide whether the raw path ever fires.
         level = "normalized" if known is None else "raw"
         if known is None:
-            fp = fingerprint(payload, beta, upstream, scope)
-            key = f"{upstream}|{beta}|{scope}|{fp.key}"
+            try:
+                fp = fingerprint(payload, beta, upstream, scope, endpoint=suffix)
+            except (TypeError, ValueError, OverflowError) as exc:
+                self._send_error(handler, 400, str(exc))
+                return
+            key = f"{upstream}|{suffix}|{beta}|{scope}|{fp.key}"
         else:
             key, fp = known
+
+        def replay_handoff(entry: tuple[int, bytes, dict[str, str], Any]) -> None:
+            status, body, hand_headers, message = entry
+            self._record(fp, payload, raw, started, "coalesced", status, message, billed=False)
+            if message is not None and status == 200:
+                self._replay(handler, message, streaming)
+            else:
+                self._raw(handler, status, body, headers=hand_headers)
 
         is_leader = False
         # Follower budget: a deadline, not a retry count. The old fixed
@@ -509,7 +581,7 @@ class ZCodeProxy:
         # duration, so a drip stream can legitimately run far longer).
         # Past the deadline a follower forwards concurrently: progress wins
         # over deduplication.
-        deadline = time.time() + self.coalesce_wait if self.coalesce_wait > 0 else None
+        deadline = time.monotonic() + self.coalesce_wait if self.coalesce_wait > 0 else None
         waited = False
         while True:
             hit = self._cache_get(key)
@@ -529,15 +601,10 @@ class ZCodeProxy:
                 self._raw(handler, status, body, headers=memo_headers)
                 return
 
-            if waited:
-                handed = self._handoff_get(key)
+            if self.coalesce:
+                handed = self._handoff_get(key, after_generation=observed_generation)
                 if handed is not None:
-                    status, body, hand_headers, message = handed
-                    self._record(fp, payload, raw, started, "coalesced", status, message, billed=False)
-                    if message is not None and status == 200:
-                        self._replay(handler, message, streaming)
-                    else:
-                        self._raw(handler, status, body, headers=hand_headers)
+                    replay_handoff(handed)
                     return
 
             if not self.coalesce:
@@ -546,7 +613,7 @@ class ZCodeProxy:
             if leader:
                 is_leader = True
                 break
-            remaining = None if deadline is None else deadline - time.time()
+            remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and remaining <= 0:
                 break
             event.wait(timeout=30 if remaining is None else min(30.0, remaining))
@@ -554,6 +621,22 @@ class ZCodeProxy:
             # leader finished (or the 30s tick): loop and re-check the result
 
         try:
+            if is_leader:
+                hit = self._cache_get(key)
+                if hit is not None:
+                    self._record(fp, payload, raw, started, "coalesced", 200, hit, billed=False)
+                    self._replay(handler, hit, streaming)
+                    return
+                memo = self._failure_get(key)
+                if memo is not None:
+                    status, body, memo_headers = memo
+                    self._record(fp, payload, raw, started, "failure_memo", status)
+                    self._raw(handler, status, body, headers=memo_headers)
+                    return
+                handed = self._handoff_get(key, after_generation=observed_generation)
+                if handed is not None:
+                    replay_handoff(handed)
+                    return
             if streaming:
                 self._forward_stream(
                     handler, payload, headers, key, raw_hash, fp, raw, started, suffix, upstream
@@ -614,10 +697,9 @@ class ZCodeProxy:
             self._raw(handler, status, body, headers=resp_headers)
             return
 
-        stored = self._store(key, raw_hash, fp, message, raw, upstream)
+        self._store(key, raw_hash, fp, message, raw, upstream)
         self._record(fp, payload, raw, started, "", 200, message)
-        if not stored and usable(message):
-            self._publish(key, 200, body, resp_headers, message)
+        self._publish(key, 200, body, resp_headers, message if usable(message) else None)
         self._raw(handler, 200, body, headers=resp_headers)
 
     def _forward_stream(
@@ -686,6 +768,18 @@ class ZCodeProxy:
             assembler = Assembler()
             aborted = False       # client hung up mid-stream
             upstream_died = False  # upstream connection broke mid-stream
+            data_lines: list[str] = []
+
+            def feed_event() -> None:
+                data = "\n".join(data_lines)
+                data_lines.clear()
+                if not data.strip() or data.strip() == "[DONE]":
+                    return
+                try:
+                    assembler.feed(json.loads(data))
+                except json.JSONDecodeError:
+                    assembler.malformed = True
+
             try:
                 for line in upstream_conn:
                     try:
@@ -695,17 +789,14 @@ class ZCodeProxy:
                         # read failure is attributed to the right side.
                         aborted = True
                         break
-                    stripped = line.decode("utf-8", "replace").strip()
-                    if not stripped.startswith("data:"):
-                        continue
-                    data = stripped[5:].strip()
-                    if not data or data == "[DONE]":
-                        continue
-                    try:
-                        parsed = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    assembler.feed(parsed)
+                    stripped = line.decode("utf-8", "replace").rstrip("\r\n")
+                    if not stripped:
+                        feed_event()
+                    elif stripped.startswith("data:"):
+                        value = stripped[5:]
+                        data_lines.append(value[1:] if value.startswith(" ") else value)
+                if data_lines and not aborted:
+                    feed_event()
             except (OSError, http.client.HTTPException):
                 # A read from the upstream failed mid-stream (drop,
                 # IncompleteRead). The client gets an explicit SSE error so a
@@ -713,10 +804,9 @@ class ZCodeProxy:
                 upstream_died = True
 
             message = assembler.finish()
-            stored = False
             if not aborted and not upstream_died and assembler.complete:
-                stored = self._store(key, raw_hash, fp, message, raw, upstream)
-                if not stored and usable(message):
+                self._store(key, raw_hash, fp, message, raw, upstream)
+                if usable(message):
                     self._publish(key, 200, b"", resp_headers, message)
             # Record before the terminal chunk: once the client sees the end of
             # the stream it may immediately ask for stats, and accounting that
@@ -780,7 +870,10 @@ class ZCodeProxy:
         # half-assembled stream must never become a replayable answer.
         if not self.cache_enabled or len(raw) > self.max_cache_bytes or not usable(message):
             return False
-        l1_key = (upstream, fp.beta, fp.scope, raw_hash)
+        stored = self.cache.put(key, LLMResponse(content=json.dumps(message, ensure_ascii=False)))
+        if not stored:
+            return False
+        l1_key = (upstream, fp.endpoint or "/v1/messages", fp.beta, fp.scope, raw_hash)
         with self._lock:
             self._l1[l1_key] = (key, fp)
             self._l1.move_to_end(l1_key)
@@ -788,7 +881,6 @@ class ZCodeProxy:
             # raw attribution for every still-hot key at once.
             while len(self._l1) > 16384:
                 self._l1.popitem(last=False)
-        self.cache.put(key, LLMResponse(content=json.dumps(message, ensure_ascii=False)))
         return True
 
     # -------------------------------------------------------------- coalescing
@@ -808,18 +900,21 @@ class ZCodeProxy:
             event.set()
 
     # ----------------------------------------------------------------- handoff
-    def _handoff_get(self, key: str) -> tuple[int, bytes, dict[str, str], Any] | None:
-        now = time.time()
+    def _handoff_get(
+        self, key: str, *, after_generation: int | None = None,
+    ) -> tuple[int, bytes, dict[str, str], Any] | None:
+        now = time.monotonic()
         with self._lock:
             entry = self._handoff.get(key)
             if entry is None:
                 return None
-            expiry, status, body, headers, message = entry
-            if expiry < now:
+            if entry.expiry < now:
                 self._handoff.pop(key, None)
-                self._handoff_bytes -= len(body) + _message_bytes(message)
+                self._handoff_bytes -= len(entry.body) + _message_bytes(entry.message)
                 return None
-            return status, body, headers, message
+            if after_generation is not None and entry.generation <= after_generation:
+                return None
+            return entry.status, entry.body, entry.headers, entry.message
 
     def _handoff_put(
         self,
@@ -834,18 +929,20 @@ class ZCodeProxy:
         size = len(body) + _message_bytes(message)
         if size > self._handoff_limit:
             return
-        entry = (time.time() + 30.0, status, body, dict(headers), message)
         with self._lock:
             old = self._handoff.pop(key, None)
             if old is not None:
-                self._handoff_bytes -= len(old[2]) + _message_bytes(old[4])
+                self._handoff_bytes -= len(old.body) + _message_bytes(old.message)
+            self._handoff_generation += 1
+            entry = _Handoff(time.monotonic() + 30.0, self._handoff_generation,
+                             status, body, dict(headers), message)
             self._handoff[key] = entry
             self._handoff_bytes += size
             while self._handoff and (
                 len(self._handoff) > 128 or self._handoff_bytes > self._handoff_limit
             ):
                 _, dropped = self._handoff.popitem(last=False)
-                self._handoff_bytes -= len(dropped[2]) + _message_bytes(dropped[4])
+                self._handoff_bytes -= len(dropped.body) + _message_bytes(dropped.message)
 
     def _publish(
         self,
@@ -911,7 +1008,8 @@ class ZCodeProxy:
         It must see the real gateway and the original ``Authorization``; the
         proxy only changes the transport from loopback TLS to the upstream.
         """
-        parts = urlsplit(self.upstream)
+        upstream = getattr(handler.server, "upstream", None) or self.upstream
+        parts = urlsplit(upstream)
         url = f"{parts.scheme}://{parts.netloc}{path}"
         forwarded = {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
         data = body if method not in {"GET", "HEAD"} else None
@@ -1045,7 +1143,7 @@ class ZCodeProxy:
         def _tokens(name: str) -> int:
             try:
                 return int(usage.get(name, 0) or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return 0
 
         self.recorder.add(

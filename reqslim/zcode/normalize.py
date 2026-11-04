@@ -11,13 +11,13 @@ the meaning:
    move, so the body changes byte-for-byte while the conversation is identical.
    Verified present in the shipped runtime (52 references in ``zcode.cjs``).
 2. **``tool_use.id`` / ``tool_result.tool_use_id``.** Freshly minted ids per
-   session. They are opaque handles; the model never reasons about them, and
-   tool results are paired positionally, so they can be dropped from the key.
+   session. They are opaque handles, but their reference graph is meaningful:
+   stable renaming preserves which parallel call each result belongs to.
 3. **Tool array order.** ZCode assembles its tool list from several registries
    (builtin, skills, MCP). The order is stable within a session but not across
    restarts or plugin reloads.
 
-Stripping exactly these three makes two genuinely-equivalent requests collide,
+Canonicalising these three makes two genuinely-equivalent requests collide,
 which is what turns a useless cache into a useful one. Everything else -- text,
 file contents, tool inputs, thinking budget -- stays in the key, because those
 do change the answer.
@@ -97,6 +97,59 @@ def _strip_block(block: Any) -> Any:
     return clean
 
 
+def _require_string(value: Any, field: str, allow_empty: bool = False) -> None:
+    if not isinstance(value, str) or (not allow_empty and not value):
+        raise ValueError(f"{field} must be a string" + ("" if allow_empty else " and nonempty"))
+
+
+def _validate_block(block: Any, field: str) -> None:
+    if not isinstance(block, Mapping):
+        raise ValueError(f"{field} must be an object")
+    kind = block.get("type")
+    _require_string(kind, f"{field}.type")
+    if kind == "text":
+        _require_string(block.get("text"), f"{field}.text", allow_empty=True)
+    elif kind == "tool_use":
+        _require_string(block.get("id"), f"{field}.id")
+        _require_string(block.get("name"), f"{field}.name")
+        if not isinstance(block.get("input"), Mapping):
+            raise ValueError(f"{field}.input must be an object")
+    elif kind == "tool_result":
+        _require_string(block.get("tool_use_id"), f"{field}.tool_use_id")
+        if "is_error" in block and not isinstance(block["is_error"], bool):
+            raise ValueError(f"{field}.is_error must be a boolean")
+        if "content" in block:
+            content = block["content"]
+            if isinstance(content, list):
+                for index, nested in enumerate(content):
+                    _validate_block(nested, f"{field}.content[{index}]")
+            elif not isinstance(content, str):
+                raise ValueError(f"{field}.content must be a string or an array of blocks")
+    elif kind == "thinking":
+        _require_string(block.get("thinking"), f"{field}.thinking", allow_empty=True)
+        if "signature" in block:
+            _require_string(block["signature"], f"{field}.signature", allow_empty=True)
+    elif kind == "redacted_thinking":
+        _require_string(block.get("data"), f"{field}.data", allow_empty=True)
+
+
+def _validate_messages(messages: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(messages, list):
+        raise ValueError("messages must be an array")
+    for index, message in enumerate(messages):
+        field = f"messages[{index}]"
+        if not isinstance(message, Mapping):
+            raise ValueError(f"{field} must be an object")
+        _require_string(message.get("role"), f"{field}.role")
+        content = message.get("content")
+        if isinstance(content, list):
+            for block_index, block in enumerate(content):
+                _validate_block(block, f"{field}.content[{block_index}]")
+        elif not isinstance(content, str):
+            raise ValueError(f"{field}.content must be a string or an array of blocks")
+    return messages
+
+
 def canonical_system(system: Any) -> Any:
     """Canonical system prompt, preserving non-text blocks.
 
@@ -109,23 +162,16 @@ def canonical_system(system: Any) -> Any:
         return ""
     if isinstance(system, str):
         return system
-    if isinstance(system, Mapping):
-        return _strip_block(system)
     if not isinstance(system, (list, tuple)):
-        return system
+        raise ValueError("system must be a string or an array of blocks")
 
     blocks: list[Any] = []
-    for block in system:
+    for index, block in enumerate(system):
         if isinstance(block, str):
             blocks.append({"type": "text", "text": block})
-        elif isinstance(block, Mapping):
-            clean = _strip_block(block)
-            if clean.get("type") == "text" and isinstance(clean.get("text"), str):
-                blocks.append({"type": "text", "text": clean["text"]})
-            else:
-                blocks.append(clean)
         else:
-            blocks.append(block)
+            _validate_block(block, f"system[{index}]")
+            blocks.append(_strip_block(block))
     if blocks and all(
         isinstance(block, dict)
         and set(block) == {"type", "text"}
@@ -139,8 +185,7 @@ def canonical_system(system: Any) -> Any:
 
 def system_text(system: Any) -> str:
     """ZCode sometimes sends a string, sometimes a list of text blocks."""
-    if system is None:
-        return ""
+    system = canonical_system(system)
     if isinstance(system, str):
         return system
     parts: list[str] = []
@@ -155,12 +200,18 @@ def system_text(system: Any) -> str:
 
 
 def canonical_tools(tools: Any) -> list[dict[str, Any]]:
-    if not tools:
-        return []
+    if not isinstance(tools, list):
+        raise ValueError("tools must be an array")
     cleaned: list[dict[str, Any]] = []
-    for tool in tools:
+    for index, tool in enumerate(tools):
+        field = f"tools[{index}]"
         if not isinstance(tool, Mapping):
-            continue
+            raise ValueError(f"{field} must be an object")
+        _require_string(tool.get("name"), f"{field}.name")
+        if "input_schema" in tool and not isinstance(tool["input_schema"], Mapping):
+            raise ValueError(f"{field}.input_schema must be an object")
+        if "description" in tool:
+            _require_string(tool["description"], f"{field}.description", allow_empty=True)
         clean = _copy(tool)
         clean.pop(_CACHE_CONTROL, None)  # tool-level breakpoint only
         cleaned.append(clean)
@@ -170,45 +221,60 @@ def canonical_tools(tools: Any) -> list[dict[str, Any]]:
 
 def canonical_messages(messages: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    for message in messages or []:
-        if not isinstance(message, Mapping):
-            continue
-        role = message.get("role")
-        content = message.get("content")
-        blocks: list[Any]
+    counts: dict[str, int] = {}
+    for message in _validate_messages(messages):
+        content = message["content"]
         if isinstance(content, str):
             blocks = [{"type": "text", "text": content}]
-        elif isinstance(content, list):
-            blocks = []
-            for block in content:
-                if not isinstance(block, Mapping):
-                    blocks.append(block)
-                    continue
-                clean = _strip_block(block)
-                kind = clean.get("type")
-                if kind == "tool_use":
-                    clean.pop("id", None)
-                elif kind == "tool_result":
-                    # ``_strip_block`` cleaned the block and its nested
-                    # content blocks; the payload itself stays verbatim.
-                    clean.pop("tool_use_id", None)
-                blocks.append(clean)
         else:
-            blocks = []
-        out.append({"role": role, "content": blocks})
+            blocks = [_strip_block(block) for block in content]
+        clean_message = {key: _copy(value) for key, value in message.items() if key != "content"}
+        clean_message["content"] = blocks
+        out.append(clean_message)
+        for block in blocks:
+            if block.get("type") == "tool_use":
+                ident = block["id"]
+                counts[ident] = counts.get(ident, 0) + 1
+    renamed = {ident: f"tool_{index}" for index, ident in enumerate(counts) if counts[ident] == 1}
+    seen: set[str] = set()
+    for message in out:
+        for block in message["content"]:
+            kind = block.get("type")
+            if kind == "tool_use":
+                ident = block["id"]
+                block["id"] = renamed[ident] if counts[ident] == 1 else f"ambiguous:{ident}"
+                seen.add(ident)
+            elif kind == "tool_result":
+                ident = block["tool_use_id"]
+                if counts.get(ident, 0) > 1:
+                    block["tool_use_id"] = f"ambiguous:{ident}"
+                elif ident in seen:
+                    block["tool_use_id"] = renamed[ident]
+                else:
+                    block["tool_use_id"] = f"unresolved:{ident}"
     return out
 
 
 def normalize_request(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Return the canonical form used for cache keys."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("request must be an object")
+    if "model" in payload:
+        _require_string(payload["model"], "model")
+    if "stream" in payload and not isinstance(payload["stream"], bool):
+        raise ValueError("stream must be a boolean")
+    if "max_tokens" in payload and (
+        isinstance(payload["max_tokens"], bool) or not isinstance(payload["max_tokens"], int)
+    ):
+        raise ValueError("max_tokens must be an integer")
     canonical: dict[str, Any] = {}
     for key, value in payload.items():
         if key in VOLATILE_TOP:
             continue
         canonical[key] = _copy(value)
     canonical["system"] = canonical_system(payload.get("system"))
-    canonical["tools"] = canonical_tools(payload.get("tools"))
-    canonical["messages"] = canonical_messages(payload.get("messages"))
+    canonical["tools"] = canonical_tools(payload.get("tools", []))
+    canonical["messages"] = canonical_messages(payload.get("messages", []))
     return canonical
 
 
@@ -231,6 +297,7 @@ class Fingerprint:
     beta: str = ""
     upstream: str = ""
     scope: str = ""
+    endpoint: str = ""
 
     @property
     def short(self) -> str:
@@ -272,7 +339,7 @@ def beta_tag(headers: Mapping[str, str]) -> str:
     return ",".join(sorted(p.strip().lower() for p in raw.split(",") if p.strip()))
 
 
-def _compaction_text(payload: Mapping[str, Any]) -> str:
+def _compaction_text(payload: Mapping[str, Any], messages: list[Mapping[str, Any]]) -> str:
     """Where the compaction instruction can ride: the system prompt, or the
     final message. The shipped runtime injects its "create a detailed summary
     of the conversation" prompt through a request-shaping step that may land it
@@ -280,7 +347,6 @@ def _compaction_text(payload: Mapping[str, Any]) -> str:
     tool_result payload is content, not an instruction.
     """
     parts = [system_text(payload.get("system"))]
-    messages = payload.get("messages") or []
     if messages:
         last = messages[-1]
         content = last.get("content") if isinstance(last, Mapping) else None
@@ -301,8 +367,10 @@ def classify(payload: Mapping[str, Any]) -> str:
     and those calls are large, unique and impossible to cache -- worth counting
     separately so they do not pollute the hit-rate number.
     """
-    messages = payload.get("messages") or []
-    if _COMPACTION_HINT.search(_compaction_text(payload)):
+    if not isinstance(payload, Mapping):
+        raise ValueError("request must be an object")
+    messages = _validate_messages(payload.get("messages", []))
+    if _COMPACTION_HINT.search(_compaction_text(payload, messages)):
         return "compaction"
     if not messages:
         return "empty"
@@ -317,7 +385,13 @@ def classify(payload: Mapping[str, Any]) -> str:
     return "continuation"
 
 
-def fingerprint(payload: Mapping[str, Any], beta: str = "", upstream: str = "", scope: str = "") -> Fingerprint:
+def fingerprint(
+    payload: Mapping[str, Any],
+    beta: str = "",
+    upstream: str = "",
+    scope: str = "",
+    endpoint: str = "",
+) -> Fingerprint:
     canonical = normalize_request(payload)
     if beta:
         canonical["anthropic_beta"] = beta
@@ -325,7 +399,7 @@ def fingerprint(payload: Mapping[str, Any], beta: str = "", upstream: str = "", 
     history = messages[:-1]
     tail = messages[-1] if messages else []
     return Fingerprint(
-        key=_digest(canonical),
+        key=_digest([canonical, endpoint]) if endpoint else _digest(canonical),
         system=_digest(canonical.get("system")),
         tools=_digest(canonical.get("tools")),
         history=_digest(history),
@@ -335,6 +409,7 @@ def fingerprint(payload: Mapping[str, Any], beta: str = "", upstream: str = "", 
         beta=beta,
         upstream=upstream,
         scope=scope,
+        endpoint=endpoint,
     )
 
 

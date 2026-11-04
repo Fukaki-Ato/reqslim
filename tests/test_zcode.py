@@ -168,6 +168,14 @@ class FakeUpstream:
                 length = int(self.headers.get("Content-Length") or 0)
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 outer.bodies.append(payload)
+                if self.path.split("?", 1)[0].endswith("/count_tokens"):
+                    body = b'{"input_tokens":42}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 if outer.delay:
                     time.sleep(outer.delay)
                 if outer.fail_status:
@@ -232,11 +240,14 @@ class TrickleUpstream:
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
                 half = len(outer.sse) // 2
-                for part in (outer.sse[:half], outer.sse[half:]):
-                    self.wfile.write(f"{len(part):X}\r\n".encode() + part + b"\r\n")
-                    self.wfile.flush()
-                    time.sleep(outer.gap)
-                self.wfile.write(b"0\r\n\r\n")
+                try:
+                    for part in (outer.sse[:half], outer.sse[half:]):
+                        self.wfile.write(f"{len(part):X}\r\n".encode() + part + b"\r\n")
+                        self.wfile.flush()
+                        time.sleep(outer.gap)
+                    self.wfile.write(b"0\r\n\r\n")
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    return
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.port = self.server.server_address[1]
@@ -470,7 +481,7 @@ def test_failure_memo_stops_a_retry_storm():
         upstream.stop()
 
 
-def test_failure_memo_is_bounded():
+def test_failure_memo_relearns_hot_keys_after_reaching_the_bound():
     """Unique-key failure storms must not grow the memo without bound."""
     proxy = ZCodeProxy("http://127.0.0.1:9", failure_ttl=30)
     for i in range(6000):
@@ -774,7 +785,7 @@ def test_proxy_stats_exposes_the_request_comparison():
         assert "actual requests     1" in report
         assert "reduced             1  (50.0%)" in report
     finally:
-        server.server_close()
+        proxy.close()
         upstream.stop()
 
 
@@ -921,8 +932,8 @@ def test_l1_is_bounded_by_lru_not_cleared():
     for index in range(16390):
         proxy._store(f"k{index}", f"raw{index}", fp, message, b"{}", "http://x")
     assert len(proxy._l1) == 16384
-    assert ("http://x", "", "", "raw0") not in proxy._l1, "oldest entry must be evicted"
-    assert ("http://x", "", "", "raw16389") in proxy._l1, "newest entry must survive"
+    assert ("http://x", "/v1/messages", "", "", "raw0") not in proxy._l1, "oldest entry must be evicted"
+    assert ("http://x", "/v1/messages", "", "", "raw16389") in proxy._l1, "newest entry must survive"
 
 
 def test_oversized_body_is_rejected_without_reading():
@@ -1790,10 +1801,11 @@ def test_non_retryable_errors_are_shared_by_coalescing():
 
 
 def test_oversized_response_is_still_shared_by_coalescing():
-    upstream = FakeUpstream(delay=0.4)
+    message = {**THINKING_MESSAGE, "content": [{"type": "text", "text": "x" * 2048}]}
+    upstream = FakeUpstream(delay=0.4, message=message)
     proxy, server, port = _proxy_with(upstream)
+    proxy.cache.max_bytes = 128
     payload = _payload()
-    payload["messages"][0]["content"][0]["text"] = "x" * 1_200_000
     outcomes: list[int] = []
     lock = threading.Lock()
 
@@ -1815,6 +1827,7 @@ def test_oversized_response_is_still_shared_by_coalescing():
         assert outcomes == [200, 200]
         assert upstream.calls == 1, "over the cache limit, handoff must still coalesce"
         assert proxy.stats()["hits"] == {"coalesced": 1}
+        assert proxy.cache.size() == 0
     finally:
         server.shutdown()
         server.server_close()
@@ -1829,7 +1842,7 @@ def test_count_tokens_path_is_forwarded():
             port, "/v1/messages/count_tokens", json.dumps(_payload()).encode()
         )
         assert status == 200
-        assert b"msg_fake" in body
+        assert json.loads(body) == {"input_tokens": 42}
         assert upstream.calls == 1
     finally:
         server.shutdown()
@@ -1991,7 +2004,7 @@ def test_stop_running_proxy_closes_the_listeners():
         time.sleep(0.2)
         assert health_on_port(port) is None
     finally:
-        server.server_close()
+        proxy.close()
         upstream.stop()
 
 
@@ -2082,6 +2095,15 @@ def test_tls_listener_serves_https_health():
 if __name__ == "__main__":
     import traceback
 
+    thread_errors = []
+    original_hook = threading.excepthook
+
+    def thread_error(args):
+        thread_errors.append((name, args))
+        print(f"FAIL  background thread during {name}: {args.exc_type.__name__}", flush=True)
+        original_hook(args)
+
+    threading.excepthook = thread_error
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     failures = 0
     for name, fn in tests:
@@ -2092,5 +2114,8 @@ if __name__ == "__main__":
             failures += 1
             print(f"FAIL  {name}")
             traceback.print_exc()
+    threading.excepthook = original_hook
+    for test_name, error in thread_errors:
+        print(f"FAIL  background thread {error.thread.name} during {test_name}: {error.exc_type.__name__}")
     print(f"\n{len(tests) - failures}/{len(tests)} passed")
-    sys.exit(1 if failures else 0)
+    sys.exit(1 if failures or thread_errors else 0)

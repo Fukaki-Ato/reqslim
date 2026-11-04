@@ -245,7 +245,7 @@ ZCode 每轮重建请求，有三处「含义没变但字节变了」的漂移�
 | 漂移 | 处理 |
 |---|---|
 | `cache_control` 断点每轮挪位置 | 剥离 |
-| `tool_use.id` / `tool_use_id` 每次会话重新生成 | 剥离 |
+| `tool_use.id` / `tool_use_id` 每次会话重新生成 | 一致地稳定重命名，保留调用与结果的引用关系 |
 | `tools` 数组由内置 + skills + MCP 拼装，顺序可能变 | 按名字排序 |
 
 另外两个机制：
@@ -331,9 +331,9 @@ python3 -m reqslim.zcode --report "$HOME/.zcode/reqslim/requests.jsonl"
 python tools/install_zcode.py --uninstall
 ```
 
-它会先停掉运行中的代理，再删掉启动文件夹里的 `reqslim proxy.lnk`、两个用户级环境变量（`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`、`ZCODE_AGENT_CA_CERT`）和 `%USERPROFILE%\.zcode\reqslim\` 下的生成文件（含 `tls\`，保留 `requests.jsonl` 流量记录），并把运行时缓存表从 `.bak-reqslim` 备份还原——否则摘掉代理后 ZCode 会永远指向死端口。已开的窗口仍带着旧环境变量，重启 ZCode 后恢复直连；注销/重登录后环境变量从所有新进程消失。
+它会先停掉运行中的代理，将运行时缓存从 `.bak-reqslim` 还原，恢复安装前的两个用户级环境变量（`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`、`ZCODE_AGENT_CA_CERT`），再移除启动项与生成配置（含 `tls\`，保留 `requests.jsonl`）。用户在安装后自行修改的环境值会保留。缓存恢复失败会返回非零，并保留重试所需文件，而不是继续删除配置。可先用 `--uninstall --dry-run` 预览，它不会停止代理或修改状态。已开的窗口仍携带旧环境，重启 ZCode 后验证直连；注销/重登录后所有新进程才统一使用恢复后的环境。
 
-也可以手动删：删启动项 lnk + `reg delete HKCU\Environment /v ZCODE_BUILTIN_PROVIDER_CONFIG_FILE /f` + `reg delete HKCU\Environment /v ZCODE_AGENT_CA_CERT /f` + 删配置目录。
+若自动卸载失败，不要直接删除配置目录或 TLS 证书。保留 `autostart.json`、环境备份、报告中的恢复快照、所有 `.bak-reqslim` 及 `*.reqslim-state.json`，先处理文件占用或权限问题，再重跑卸载。确需手动恢复时，先停止所有 reqslim 实例及 watcher，再依据归属记录逐个还原属于本工具的 provider 上游；保留后来新增的 provider、元数据及用户自行设置的代理。只有确认当前表没有其他变更时，才可直接使用旧备份原文，不能用首次备份整表覆盖新版表。确认不再引用本工具监听后，恢复安装前的两个用户级环境变量，最后才移除启动项和生成配置。重启 ZCode 并验证连接后再清理剩余恢复文件。
 
 ZCode 安装目录和用户配置自始至终没有被修改过。
 
@@ -374,7 +374,8 @@ ZCode 安装目录和用户配置自始至终没有被修改过。
 │       ├── tls.py                    本机 HTTPS 证书与 CA bundle
 │       └── __main__.py               CLI
 ├── tools\install_zcode.py            安装器（自动探测 + 改写 provider 表/缓存表 + 注册自启）
-├── tests\test_zcode.py               80 个用例
+├── tests\test_zcode.py               原有集成测试
+├── tests\test_*regressions.py        缓存、协议与安装恢复回归测试
 ├── start-zcode.bat                   启动器（安装时生成）
 ├── zcode-stats.bat / zcode-report.bat 报告（安装时生成）
 └── docs\ZCode接入指南.md             本文

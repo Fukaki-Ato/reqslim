@@ -21,6 +21,7 @@ and the replay emits the same shapes back.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any, Mapping
 
 #: Block types whose payload arrives entirely in content_block_start.
@@ -40,7 +41,7 @@ class Assembler:
             "usage": {"input_tokens": 0, "output_tokens": 0},
         }
         self._blocks: dict[int, dict[str, Any]] = {}
-        self._partial: dict[int, str] = {}
+        self._partial: dict[int, str | None] = {}
         self.events = 0
         #: Set when the upstream reported a failure *inside* the stream.
         self.error: dict[str, Any] | None = None
@@ -83,7 +84,7 @@ class Assembler:
             started = event.get("message")
             if not isinstance(started, Mapping):
                 raise ValueError("message_start.message must be an object")
-            self.message.update(started)
+            self.message.update(deepcopy(dict(started)))
             self.message.setdefault("content", [])
             self.message.setdefault("usage", {"input_tokens": 0, "output_tokens": 0})
 
@@ -99,10 +100,10 @@ class Assembler:
             content_block = event.get("content_block")
             if not isinstance(content_block, Mapping):
                 raise ValueError("content_block must be an object")
-            block = dict(content_block)
+            block = deepcopy(dict(content_block))
             if block.get("type") == "tool_use":
                 block.setdefault("input", {})
-                self._partial[index] = ""
+                self._partial[index] = None
             self._blocks[index] = block
 
         elif kind == "content_block_delta":
@@ -111,7 +112,18 @@ class Assembler:
             if not isinstance(delta, Mapping):
                 raise ValueError("delta must be an object")
             block = self._blocks.setdefault(index, {"type": "text", "text": ""})
-            if "text" in delta:
+            if delta.get("type") == "citations_delta" or "citation" in delta:
+                citation = delta.get("citation")
+                if not isinstance(citation, Mapping):
+                    raise ValueError("citations_delta.citation must be an object")
+                citations = block.get("citations")
+                if citations is None:
+                    citations = []
+                if not isinstance(citations, list):
+                    raise ValueError("content_block.citations must be an array")
+                citations.append(deepcopy(dict(citation)))
+                block["citations"] = citations
+            elif "text" in delta:
                 text = delta["text"]
                 if not isinstance(text, str):
                     raise ValueError("text_delta.text must be a string")
@@ -125,19 +137,22 @@ class Assembler:
                 signature = delta["signature"]
                 if not isinstance(signature, str):
                     raise ValueError("signature_delta.signature must be a string")
-                block["signature"] = signature
+                block["signature"] = block.get("signature", "") + signature
             elif "partial_json" in delta:
                 partial = delta["partial_json"]
                 if not isinstance(partial, str):
                     raise ValueError("input_json_delta.partial_json must be a string")
-                self._partial[index] = self._partial.get(index, "") + partial
+                self._partial[index] = (self._partial.get(index) or "") + partial
 
         elif kind == "content_block_stop":
             index = self._index(event)
             if index in self._partial:
                 raw = self._partial.pop(index)
                 try:
-                    parsed = json.loads(raw) if raw.strip() else {}
+                    if raw is None:
+                        parsed = self._blocks[index].get("input")
+                    else:
+                        parsed = json.loads(raw) if raw.strip() else {}
                 except json.JSONDecodeError:
                     parsed = None
                 if not isinstance(parsed, dict):
@@ -203,30 +218,38 @@ class Assembler:
 
 def _blank(block: Mapping[str, Any]) -> dict[str, Any]:
     kind = block.get("type", "text")
+    blank = dict(block)
     if kind == "text":
-        return {"type": "text", "text": ""}
-    if kind == "thinking":
-        return {"type": "thinking", "thinking": ""}
-    if kind == "tool_use":
-        return {
-            "type": "tool_use",
-            "id": block.get("id", "toolu_reqslim"),
-            "name": block.get("name", ""),
-            "input": {},
-        }
-    return dict(block)
+        blank.setdefault("type", kind)
+        blank["text"] = ""
+        citations = block.get("citations")
+        if isinstance(citations, list) and all(isinstance(item, Mapping) for item in citations):
+            blank["citations"] = []
+    elif kind == "thinking":
+        blank["thinking"] = ""
+        if isinstance(block.get("signature"), str):
+            blank["signature"] = ""
+    elif kind == "tool_use":
+        blank.setdefault("id", "toolu_reqslim")
+        blank.setdefault("name", "")
+        blank["input"] = {}
+    return blank
 
 
 def _deltas(index: int, block: Mapping[str, Any]) -> list[dict[str, Any]]:
     kind = block.get("type", "text")
     if kind == "text":
         text = block.get("text", "")
-        return (
-            [{"type": "content_block_delta", "index": index,
-              "delta": {"type": "text_delta", "text": text}}]
-            if isinstance(text, str) and text
-            else []
-        )
+        out = []
+        if isinstance(text, str) and text:
+            out.append({"type": "content_block_delta", "index": index,
+                        "delta": {"type": "text_delta", "text": text}})
+        citations = block.get("citations")
+        if isinstance(citations, list) and all(isinstance(item, Mapping) for item in citations):
+            for citation in citations:
+                out.append({"type": "content_block_delta", "index": index,
+                            "delta": {"type": "citations_delta", "citation": dict(citation)}})
+        return out
     if kind == "thinking":
         out = []
         thinking = block.get("thinking", "")
