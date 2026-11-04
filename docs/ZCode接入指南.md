@@ -5,7 +5,7 @@
 适用于任何装了 ZCode 的设备。文中不写死盘符和用户名，所有路径都用占位符或环境变量表示。
 
 - **不改** ZCode 安装目录
-- **不改** ZCode 的用户设置；会改写它的 provider 表副本与运行时缓存表（均有备份，卸载自动还原）
+- **不改** ZCode 的用户设置/安装目录；会设置两个用户级环境变量（provider 表、本地 CA），并改写 provider 表副本与运行时缓存表（均有备份，卸载自动还原）
 - **不碰** 你的登录凭据
 - 随时可以摘掉，摘掉后行为与原来完全一致
 
@@ -54,13 +54,15 @@ ZCode 有两层 provider 表（3.16/3.17 的 asar 反编译证实，读取顺序
 1. **运行时缓存表**：`%USERPROFILE%\.zcode\v2\runtime\provider\<平台>\<版本>\endpoint-<哈希>\zcode-builtin.json`，由云端定期刷新；**agent 宿主进程优先读它**。每次 ZCode 升级都会在新版本目录下生成一份新的——不改写它，流量就静默直连（环境变量形同虚设）。
 2. **环境变量表**：`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 指向的文件，只是第 1 层读失败时的回落。全新机器或刚升级、缓存还没生成时靠它兜底。
 
-所以接入必须两层都做：安装器**逐份改写运行时缓存表**（每份留一个 `.bak-reqslim` 备份，只备份一次；幂等，重复运行显示 untouched），同时生成改写过的环境变量表 `%USERPROFILE%\.zcode\reqslim\zcode-builtin.proxied.json`。代理后台每分钟检查两层：ZCode 更新换表、云刷新覆盖缓存，都会在一分钟内被重新改写。
+所以接入必须两层都做：安装器**逐份改写运行时缓存表**（每份留一个 `.bak-reqslim` 备份，只备份一次；幂等，重复运行显示 untouched），同时生成改写过的环境变量表 `%USERPROFILE%\.zcode\reqslim\zcode-builtin.proxied.json`。改写后的运行时缓存会被设为**只读**：ZCode 的云端刷新会因 `EPERM` 失败并继续使用本地表（日志里的 `Builtin 远端更新失败，继续使用本地配置` 属预期），否则云刷新会在启动窗口把本地表覆盖回直连地址。代理后台每分钟检查两层；ZCode 升级产生的新版本缓存会自动改写并设为只读。
+
+**本机监听必须是 HTTPS。** ZCode 3.17 对套餐账号启用客户端请求签名，签名器在构造阶段就拒绝 `http://` baseURL（日志表现为 `ClientRequestSigningV4Error: Client signing handshake requires HTTPS.`，请求根本不会发出）。安装器因此生成一套仅本机使用的 CA + `127.0.0.1` 证书（`%USERPROFILE%\.zcode\reqslim\tls\`），把 `ZCODE_AGENT_CA_CERT` 指向含系统根证书与私有 CA 的 `ca-bundle.pem`；代理同时把签名握手 `/api/paas/...` 转发到真实网关。旧客户端/排查时可加 `--no-tls`，但 3.17+ 套餐账号会直接失败。
 
 ```
-ZCode ──HTTP──> 127.0.0.1:8788（reqslim） ──HTTPS──> 上游 API
-                    │
-                    ├─ 命中缓存：直接返回，不发出请求
-                    └─ 未命中：原样转发（含 Authorization 头）
+ZCode ──HTTPS──> 127.0.0.1:8788（reqslim） ──HTTPS──> 上游 API
+                     │
+                     ├─ 命中缓存：直接返回，不发出请求
+                     └─ 未命中：原样转发（含 Authorization / 签名头）
 ```
 
 provider 用的网关不止一个时（API key 模板和套餐账号常不同），每个上游占一个本地端口，但仍是一个代理进程、一份流量记录。
@@ -82,10 +84,12 @@ python tools\install_zcode.py
 zcode       <自动探测到的安装目录>
 module      <模块目录>
 config      %USERPROFILE%\.zcode\reqslim
-listen      127.0.0.1:8788  ->  https://open.bigmodel.cn/api/anthropic
+listen      https://127.0.0.1:8788  ->  https://open.bigmodel.cn/api/anthropic
             account:bigmodel-individual-coding-plan, account:bigmodel-team-coding-plan, bigmodel-api
-listen      127.0.0.1:8789  ->  https://zcode.z.ai/api/v1/zcode-plan/anthropic
+listen      https://127.0.0.1:8789  ->  https://zcode.z.ai/api/v1/zcode-plan/anthropic
             account:zai-start-plan, account:bigmodel-start-plan
+tls         %USERPROFILE%\.zcode\reqslim\tls\server.crt
+            CA bundle for ZCode: %USERPROFILE%\.zcode\reqslim\tls\ca-bundle.pem
 launcher    <模块目录>\start-zcode.bat
 cache       runtime provider caches: 1 rewritten, 1 untouched
             rewritten %USERPROFILE%\.zcode\v2\runtime\provider\windows-x86_64\3.17.2\endpoint-<哈希>\zcode-builtin.json
@@ -114,6 +118,7 @@ python tools\install_zcode.py --zcode-dir "<ZCode 安装目录>"
 | `zcode-builtin.proxied.json` | 改写后的 provider 表 |
 | `zcode-builtin.original.json` | 原表备份，出问题可对比 |
 | `requests.jsonl` | 运行后生成，逐请求记录 |
+| `tls\` | 本机 CA、`127.0.0.1` 服务器证书与 `ca-bundle.pem`（供 `ZCODE_AGENT_CA_CERT`） |
 
 **ZCode 运行时缓存目录**（`%USERPROFILE%\.zcode\v2\runtime\provider\<平台>\<版本>\endpoint-<哈希>\`）：`zcode-builtin.json` 被逐份改写，原件备份为同目录的 `zcode-builtin.json.bak-reqslim`（只备份一次，重复运行与云刷新都不覆盖；`--uninstall` 时从备份还原）。
 
@@ -124,8 +129,9 @@ python tools\install_zcode.py --zcode-dir "<ZCode 安装目录>"
 | `--upstream` | 上游地址，默认 BigModel 的 anthropic 端点；也可填预设名 `bigmodel` / `zai` / `anthropic` / `moonshot` / `deepseek` |
 | `--extra-upstream` | 额外上游（URL 或预设名，可重复）。同一个套餐家族常落在不同网关（API key 模板走 `open.bigmodel.cn`，套餐账号走 `zcode.z.ai`），每个上游分一个本地端口，全部收进同一个代理进程、同一份报告 |
 | `--port` | 主端口，默认 `8788`，额外上游依次 +1 |
-| `--no-autostart` | 只写配置和手动启动器，不注册开机自启、不设用户级环境变量（Windows 默认注册） |
-| `--uninstall` | 移除自启项、用户级环境变量和生成的配置文件；保留 `requests.jsonl` |
+| `--no-tls` | 用普通 HTTP 监听（旧客户端/排查用）；ZCode 3.17+ 套餐账号会因签名层拒绝 HTTP 而失败 |
+| `--no-autostart` | 只写配置和手动启动器，不注册开机自启、不设用户级环境变量；**仍会改写运行时缓存**，必须先运行 `start-zcode.bat` 再打开 ZCode |
+| `--uninstall` | 先停止运行中的代理，再移除自启项、两个用户级环境变量和生成的配置文件，并还原运行时缓存；保留 `requests.jsonl` |
 | `--zcode-dir` | 手动指定 ZCode 安装目录（或 macOS 的 `Contents/Resources`） |
 | `--package-dir` | 模块目录，默认取脚本的上级，一般不用给 |
 | `--dry-run` | 只打印会改哪些 provider，不写文件 |
@@ -138,7 +144,7 @@ python tools\install_zcode.py --zcode-dir "<ZCode 安装目录>"
 
 ## 3. 日常使用
 
-**Windows 装好后什么都不用做**：代理已注册到启动文件夹（登录即运行，`pythonw` 无窗口），`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 已设为用户级环境变量——直接打开 ZCode（任务栏 / 开始菜单 / 任何方式），流量自动走代理。
+**Windows 装好后什么都不用做**：代理已注册到启动文件夹（登录即运行，`pythonw` 无窗口），`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 与 `ZCODE_AGENT_CA_CERT` 已设为用户级环境变量——直接打开 ZCode（任务栏 / 开始菜单 / 任何方式），流量自动走 HTTPS 代理。
 
 - 代理日志：`%USERPROFILE%\.zcode\reqslim\proxy.log`
 - ZCode 更新后无需重装：代理每分钟检查 ZCode 自带 provider 表**和运行时缓存表**，升级产生的新版本缓存同样在一分钟内自动改写接入
@@ -155,12 +161,18 @@ python tools\install_zcode.py --zcode-dir "<ZCode 安装目录>"
 | 方式 | 操作 |
 |---|---|
 | 实时（代理在跑） | 双击 `zcode-stats.bat` |
-| 浏览器 | `http://127.0.0.1:8788/v1/report` |
+| 浏览器 | `https://127.0.0.1:8788/v1/report`（私有 CA，浏览器需信任/继续访问） |
 | 离线（读历史） | 双击 `zcode-report.bat` |
 
 输出示例：
 
 ```
+request reduction
+  estimated requests  8
+  actual requests     3
+  reduced             5  (62.5%)
+  by mechanism        failure_memo=2, normalized=2, raw=1
+
 requests        8
 upstream calls  3
 cache hits      5  (62.5%)
@@ -178,9 +190,13 @@ top repeated requests
 
 | 字段 | 含义 |
 |---|---|
-| `requests` | ZCode 发起的请求总数 |
-| `upstream calls` | 真正打到上游的次数 |
-| `by level` | `raw` = 字节完全相同命中（最便宜）；`normalized` = 规范化后命中；`failure_memo` = 失败记忆命中 |
+| `estimated requests` | ZCode 发起的逻辑请求总数；没有代理时上游会收到的次数 |
+| `actual requests` | 真正打到上游、消耗一次上游调用的次数 |
+| `reduced` | 两者之差，即 reqslim 减少的请求量；括号内为减少比例 |
+| `by mechanism` | 减少量按 `raw` / `normalized` / `coalesced` / `failure_memo` 归因 |
+| `requests` | 与 `estimated requests` 相同，保留旧字段兼容 |
+| `upstream calls` | 与 `actual requests` 相同，保留旧字段兼容 |
+| `by level` | `raw` = 字节完全相同命中（最便宜）；`normalized` = 规范化后命中；`coalesced` = 单飞跟随；`failure_memo` = 失败记忆命中 |
 | `tokens in/out` | **真正打到上游**的 token 数，命中回放不重复计入 |
 | `tokens avoided` | 省掉的请求体估算 token（按字节 / 3） |
 | `request kinds` | `first_turn` / `tool_turn` / `continuation` / `compaction` |
@@ -188,7 +204,7 @@ top repeated requests
 | `storms` | 60 秒内重复的请求数（重试循环的特征） |
 | `near-dupes` | 最后一轮相同但历史不同——**缓存不了，但说明上下文在膨胀** |
 
-`requests.jsonl` 默认在 32 MB 处轮转：每次启动代理时检查，超限就把上一份改名为 `requests.jsonl.1` 再重新开始。轮转只在启动时发生，所以一次会话的记录始终完整；`--report` 读的是当前文件。
+`requests.jsonl` 默认在 32 MB 处轮转：写入时检查，超限就把上一份改名为 `requests.jsonl.1` 再写新文件；`--report` 每次读取当前文件（会加载完整文件，不再只保留最近 5 万条）。
 
 ---
 
@@ -208,14 +224,17 @@ python -m reqslim.zcode --upstream https://open.bigmodel.cn/api/anthropic --port
 | `--ttl` | `3600` | 缓存存活秒数 |
 | `--max-cache` | `4096` | 最多缓存多少条响应 |
 | `--failure-ttl` | `20` | 失败记忆秒数，`0` 关闭 |
-| `--no-cache` | — | 关闭缓存，只保留转发和记录（排查用） |
+| `--coalesce-wait` | `600` | follower 等待 leader 的秒数；`0` 表示无限等 |
+| `--no-cache` | — | 关闭缓存，只保留转发、单飞和记录（排查用） |
 | `--no-coalesce` | — | 关闭单飞合并 |
 | `--record` | `%USERPROFILE%\.zcode\reqslim\requests.jsonl` | 记录路径 |
 | `--no-record` | — | 不写记录 |
 
-多上游时缓存、单飞、失败记忆都**按上游分区**：同一个请求换一个网关就是另一段对话，不会拿 A 网关缓存的回答回放给 B 网关的请求——否则摘掉代理后行为就不一致了。
+安装器的 `--ttl` / `--max-cache` / `--no-cache` / `--no-coalesce` / `--coalesce-wait` / `--failure-ttl` 会写入 `autostart.json`，由 `--autostart` 读取；不再出现“参数被静默忽略”。
 
-`--host` 默认 `127.0.0.1`，只监听本机回环。**不要改成 `0.0.0.0`**：代理会原样转发 `Authorization` 头，暴露到局域网等于把 API key 交给同网段的任何人。
+多上游时缓存、单飞、失败记忆都**按网关 + 凭据 + beta/version 分区**：同一个请求换一个网关或账号就是另一段对话，不会拿 A 的回答回放给 B 的请求——否则摘掉代理后行为就不一致了。
+
+`--host` 默认 `127.0.0.1`，只监听本机回环。**不要改成 `0.0.0.0`**：代理会转发 `Authorization` 头，暴露到局域网等于把 API key 交给同网段的任何人。
 
 ---
 
@@ -290,7 +309,7 @@ python3 -m reqslim.zcode --report "$HOME/.zcode/reqslim/requests.jsonl"
 | 安装器报找不到 ZCode | 装在非常规位置 | `--zcode-dir "<安装目录>"`，或设 `ZCODE_HOME` |
 | 安装器报 no provider uses ... | 你的套餐走的是别的上游 | 用 `--upstream` 填真实地址；`--dry-run` 可先看会改哪些 |
 | ZCode 报连接失败 / 一直转圈 | 代理窗口没起来或已关闭 | 重开启动器；或手动 `cd /d "<模块目录>"` 后跑 `python -m reqslim.zcode`，看报错 |
-| 启动器一闪而过 | 端口被占用 | `netstat -ano \| findstr 8788` 找进程，或换 `--port 8799` 并重跑安装器 |
+| 启动器一闪而过 | 端口被占用 | `netstat -ano \| findstr 8788` 找进程，或换 `--port 8799` 并重跑安装器；安装器会先停旧代理，再从 `.bak-reqslim` 重映射缓存 |
 | `zcode-stats.bat` 提示 proxy is not running | 代理没启动 | 先开启动器 |
 | `requests` 一直是 0 | 请求没走代理 | 确认 ZCode 当前选中的 provider 出现在安装器的 `listen` 行里；在 `uncovered` 行里就再跑一次安装器加 `--extra-upstream` |
 | 报 `invalid signature` | thinking 签名重放被拒 | 用 `--no-cache` 启动确认是否缓存导致；确认后长期加该参数 |
@@ -304,7 +323,7 @@ python3 -m reqslim.zcode --report "$HOME/.zcode/reqslim/requests.jsonl"
 
 ## 10. 回滚
 
-**临时关闭**：用 `--no-autostart` 安装、或不经自启启动时，直接双击 ZCode 图标即可——环境变量不设置，走原路径。
+**临时关闭**：先运行 `python tools/install_zcode.py --uninstall`（会停代理并还原缓存），再直接打开 ZCode。`--no-autostart` 不是关闭开关：它只跳过登录自启和用户环境变量，运行时缓存仍会被改写，必须先用 `start-zcode.bat` 启动代理。
 
 **彻底清理**（推荐）：
 
@@ -312,9 +331,9 @@ python3 -m reqslim.zcode --report "$HOME/.zcode/reqslim/requests.jsonl"
 python tools/install_zcode.py --uninstall
 ```
 
-它会删掉启动文件夹里的 `reqslim proxy.lnk`、用户级环境变量 `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` 和 `%USERPROFILE%\.zcode\reqslim\` 下的生成文件（保留 `requests.jsonl` 流量记录），并把运行时缓存表从 `.bak-reqslim` 备份还原——否则摘掉代理后 ZCode 会永远指向死端口。已开的窗口仍带着旧环境变量，重启 ZCode 后恢复直连；注销/重登录后环境变量从所有新进程消失。
+它会先停掉运行中的代理，再删掉启动文件夹里的 `reqslim proxy.lnk`、两个用户级环境变量（`ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`、`ZCODE_AGENT_CA_CERT`）和 `%USERPROFILE%\.zcode\reqslim\` 下的生成文件（含 `tls\`，保留 `requests.jsonl` 流量记录），并把运行时缓存表从 `.bak-reqslim` 备份还原——否则摘掉代理后 ZCode 会永远指向死端口。已开的窗口仍带着旧环境变量，重启 ZCode 后恢复直连；注销/重登录后环境变量从所有新进程消失。
 
-也可以手动删：删启动项 lnk + `reg delete HKCU\Environment /v ZCODE_BUILTIN_PROVIDER_CONFIG_FILE /f` + 删配置目录。
+也可以手动删：删启动项 lnk + `reg delete HKCU\Environment /v ZCODE_BUILTIN_PROVIDER_CONFIG_FILE /f` + `reg delete HKCU\Environment /v ZCODE_AGENT_CA_CERT /f` + 删配置目录。
 
 ZCode 安装目录和用户配置自始至终没有被修改过。
 
@@ -323,16 +342,19 @@ ZCode 安装目录和用户配置自始至终没有被修改过。
 ## 11. 已知限制
 
 - **近似重复缓存不了**：同一个问题但历史更长，内容确实不同，不该命中。这类请求会体现在 `near-dupes` 里。
-- **流式错误不缓存**：上游用 `200 + event: error` 报错时（过载就是这样），这次响应不会被缓存，重试会真实打到上游——宁可多打一次，也不回放一个假的空回答。
-- **超过 1 MB 的请求体不缓存**：保护内存，长上下文会话的最后几轮通常属于这类。
+- **流式错误不缓存**：上游用 `200 + event: error` 报错时（过载就是这样），这次响应不会被缓存，重试会真实打到上游。上游中途断流时，代理会发送一条 SSE `error` 事件，客户端不会把半截回答当成正常完成。
+- **超过 1 MB 的请求体不写入缓存**：保护内存，长上下文会话的最后几轮通常属于这类；同一时刻的重复请求仍由单飞交接共享，后续独立请求会重新打上游。
 - **缓存命中时不是逐字流式**：会一次性返回完整 SSE，速度更快，但少了打字机效果。
-- **只代理 `anthropic-messages` 协议的 provider**：OpenAI 兼容的那几个模板不在改写范围。
+- **只代理 Anthropic Messages 端点**：`/v1/messages` 与 `/v1/messages/count_tokens`；其它路径会 404 并关闭连接，避免未读 body 污染 keep-alive。
 - **代理是单进程单实例**：同一端口开第二个会直接报错退出，不会自动换端口。Windows 默认的 `SO_REUSEADDR` 允许两个进程绑同一端口并静默抢流量，所以这里特意关掉了。
+- **升级/换端口会重启代理**：安装器与 `--autostart` 会先停旧实例，再用 `.bak-reqslim` 重映射运行时缓存；0.2.2 旧实例没有 `/v1/shutdown`，需要先手动结束或重启一次。
+- **缓存/单飞/失败记忆按网关 + 凭据 + beta/version 分区**：同网关换账号不会串用回答。
 - **ZCode 更新后表同步有 ≤1 分钟窗口**：自启代理每 60 秒检查一次 ZCode 自带 provider 表，更新落地后的新 provider 在下一次检查时自动接入；若恰好在检查间隙重启 ZCode，那一次启动读到的还是上一份表，之后再自动补齐。
 - **新增网关需要重跑安装器**：表监视只覆盖已知上游上的变化；ZCode 若接入了全新网关（新的 `baseUrl`），需要重跑一次安装器把它加进监听（`--extra-upstream`）。
 - **自启依赖三样东西完好**：Python 解释器路径（lnk 里写死 `pythonw.exe`）、模块目录位置、启动文件夹权限。移动模块文件夹或升级 Python 后重跑一次安装器即可修复；杀软若清掉启动项，手动兜底 `start-zcode.bat` 始终可用。
-- **缓存表改写与云刷新存在竞态**：云端以新 revision 覆盖缓存后，代理的缓存监视会在一分钟内改写回来；窗口期启动的 ZCode 会读到一次未改写的表，下次启动恢复。
+- **缓存表是只读的**：安装器把改写后的运行时缓存设为只读，云端刷新会失败并保留本地表；ZCode 日志可能出现 `EPERM` / `Builtin 远端更新失败，继续使用本地配置`，这是预期行为。要接入新 provider/新网关仍应重跑安装器；`--uninstall` 会恢复为可写并还原原始表。
 - **改写缓存表需要重启 ZCode 才生效**：provider registry 在 ZCode 启动时构建，运行中改文件不会重建。
+- **本机 HTTPS 使用私有 CA**：证书只覆盖 `127.0.0.1` / `localhost`，通过 `ZCODE_AGENT_CA_CERT` 提供给 ZCode；浏览器/curl 直接看报告需 `-k`。`--uninstall` 会删除 `tls\` 并移除该环境变量。
 
 ---
 
@@ -347,10 +369,12 @@ ZCode 安装目录和用户配置自始至终没有被修改过。
 │       ├── normalize.py              请求规范化（剥离漂移字段）
 │       ├── stream.py                 流装配 / 重放（含 thinking 签名）
 │       ├── analytics.py              流量记录与统计
+│       ├── comparison.py             预估/实际上游请求对比
 │       ├── proxy.py                  代理主逻辑
+│       ├── tls.py                    本机 HTTPS 证书与 CA bundle
 │       └── __main__.py               CLI
 ├── tools\install_zcode.py            安装器（自动探测 + 改写 provider 表/缓存表 + 注册自启）
-├── tests\test_zcode.py               49 个用例
+├── tests\test_zcode.py               80 个用例
 ├── start-zcode.bat                   启动器（安装时生成）
 ├── zcode-stats.bat / zcode-report.bat 报告（安装时生成）
 └── docs\ZCode接入指南.md             本文

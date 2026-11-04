@@ -22,12 +22,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import ssl
 import sys
 import threading
 import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .analytics import load_events
 from .proxy import ZCodeProxy
@@ -40,6 +42,16 @@ from .wiring import (
 )
 
 DEFAULT_UPSTREAM = "https://open.bigmodel.cn/api/anthropic"
+
+#: Local health/shutdown calls must never go through an environment proxy.
+_LOCAL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+#: The listener may be HTTPS (ZCode's signer requires it).  The certificate is
+#: a loopback-only one made by this installer, so hostname verification against
+#: the machine's root store is deliberately not part of the local probe.
+_LOCAL_TLS_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    urllib.request.HTTPSHandler(context=ssl._create_unverified_context()),
+)
 
 #: How often the autostart watcher re-checks ZCode's bundled provider table.
 #: ZCode updates land between app launches; a minute of staleness after an
@@ -65,7 +77,10 @@ def parse_listeners(specs: list[str]) -> list[tuple[int, str]]:
         port, sep, url = spec.partition("=")
         if not sep or not port.isdigit() or not url:
             raise SystemExit(f"--listen expects PORT=URL, got: {spec}")
-        listeners.append((int(port), url.rstrip("/")))
+        number = int(port)
+        if not 0 < number <= 65535:
+            raise SystemExit(f"--listen port must be 1..65535, got: {spec}")
+        listeners.append((number, url.rstrip("/")))
     ports = [port for port, _ in listeners]
     if len(set(ports)) != len(ports):
         raise SystemExit(f"--listen: duplicate ports: {ports}")
@@ -79,7 +94,47 @@ class AutostartSpec:
     record: str | None
     zcode_table: str
     config_dir: str
-    poll_seconds: float
+    poll_seconds: float = DEFAULT_POLL_SECONDS
+    ttl: float = 3600.0
+    max_cache: int = 4096
+    cache_enabled: bool = True
+    coalesce: bool = True
+    coalesce_wait: float = 600.0
+    failure_ttl: float = 20.0
+    tls_cert: str | None = None
+    tls_key: str | None = None
+
+
+def _float_value(value: Any, default: float, name: str, minimum: float | None = None) -> float:
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise SystemExit(f"autostart config {name} must be a number, got: {value!r}")
+    if minimum is not None and parsed < minimum:
+        raise SystemExit(f"autostart config {name} must be >= {minimum}, got: {value!r}")
+    return parsed
+
+
+def _int_value(value: Any, default: int, name: str) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise SystemExit(f"autostart config {name} must be an integer, got: {value!r}")
+    if parsed < 0:
+        raise SystemExit(f"autostart config {name} must be >= 0, got: {value!r}")
+    return parsed
+
+
+def _bool_value(value: Any, default: bool, name: str) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise SystemExit(f"autostart config {name} must be true or false, got: {value!r}")
+    return value
 
 
 def load_autostart_config(path: str) -> AutostartSpec:
@@ -93,13 +148,20 @@ def load_autostart_config(path: str) -> AutostartSpec:
         data = json.loads(config.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"autostart config unreadable: {path} ({exc})")
+    if not isinstance(data, dict):
+        raise SystemExit(f"autostart config must be a JSON object: {path}")
     listeners: list[tuple[int, str]] = []
-    for item in data.get("listeners") or []:
+    raw_listeners = data.get("listeners")
+    if not isinstance(raw_listeners, list):
+        raise SystemExit("autostart config listeners must be a list")
+    for item in raw_listeners:
         try:
             port, url = item
         except (TypeError, ValueError):
             raise SystemExit(f"autostart listeners expect [port, url] pairs, got: {item!r}")
-        if not isinstance(port, int) or port <= 0 or not isinstance(url, str) or not url:
+        if not isinstance(port, int) or isinstance(port, bool) or not 0 < port <= 65535:
+            raise SystemExit(f"autostart listeners expect [port, url] pairs, got: {item!r}")
+        if not isinstance(url, str) or not url:
             raise SystemExit(f"autostart listeners expect [port, url] pairs, got: {item!r}")
         listeners.append((port, url.rstrip("/")))
     if not listeners:
@@ -107,29 +169,148 @@ def load_autostart_config(path: str) -> AutostartSpec:
     ports = [port for port, _ in listeners]
     if len(set(ports)) != len(ports):
         raise SystemExit(f"autostart config has duplicate ports: {ports}")
-    if not data.get("zcode_table"):
+    if not isinstance(data.get("zcode_table"), str) or not data.get("zcode_table"):
         raise SystemExit("autostart config is missing zcode_table")
-    if not data.get("config_dir"):
+    if not isinstance(data.get("config_dir"), str) or not data.get("config_dir"):
         raise SystemExit("autostart config is missing config_dir")
+    tls_cert = tls_key = None
+    raw_tls = data.get("tls")
+    if raw_tls is not None:
+        if not isinstance(raw_tls, dict):
+            raise SystemExit("autostart config tls must be an object")
+        tls_cert = raw_tls.get("cert")
+        tls_key = raw_tls.get("key")
+        if bool(tls_cert) != bool(tls_key):
+            raise SystemExit("autostart config tls needs both cert and key")
+        if tls_cert is not None and (not isinstance(tls_cert, str) or not tls_cert):
+            raise SystemExit("autostart config tls.cert must be a path")
+        if tls_key is not None and (not isinstance(tls_key, str) or not tls_key):
+            raise SystemExit("autostart config tls.key must be a path")
     return AutostartSpec(
         listeners=listeners,
-        record=data.get("record"),
+        record=data.get("record") if isinstance(data.get("record"), str) else None,
         zcode_table=data["zcode_table"],
         config_dir=data["config_dir"],
-        poll_seconds=float(data.get("poll_seconds") or DEFAULT_POLL_SECONDS),
+        poll_seconds=_float_value(
+            data.get("poll_seconds"), DEFAULT_POLL_SECONDS, "poll_seconds", minimum=0.1
+        ),
+        ttl=_float_value(data.get("ttl"), 3600.0, "ttl", minimum=0.0),
+        max_cache=_int_value(data.get("max_cache"), 4096, "max_cache"),
+        cache_enabled=_bool_value(data.get("cache"), True, "cache"),
+        coalesce=_bool_value(data.get("coalesce"), True, "coalesce"),
+        coalesce_wait=_float_value(
+            data.get("coalesce_wait"), 600.0, "coalesce_wait", minimum=0.0
+        ),
+        failure_ttl=_float_value(data.get("failure_ttl"), 20.0, "failure_ttl", minimum=0.0),
+        tls_cert=tls_cert,
+        tls_key=tls_key,
     )
 
 
-def reqslim_on_port(port: int, timeout: float = 2.0) -> bool:
-    """Whether a reqslim proxy (not some other app) is serving this port."""
+def health_on_port(
+    port: int, timeout: float = 2.0, *, scheme: str = "http"
+) -> dict[str, Any] | None:
+    """Return the health document for a reqslim instance, or None.
+
+    Listeners can be HTTP (older installs, ``--no-tls``) or HTTPS (the
+    installer's default for ZCode 3.17's signer).  Callers know which one
+    they configured; probing the wrong scheme would make the other listener
+    log a protocol error on every poll.
+    """
+    opener = _LOCAL_TLS_OPENER if scheme == "https" else _LOCAL_OPENER
     try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/v1/health", timeout=timeout
+        with opener.open(
+            f"{scheme}://127.0.0.1:{port}/v1/health", timeout=timeout
         ) as response:
             data = json.loads(response.read() or b"{}")
     except Exception:  # noqa: BLE001 - anything answering is not reqslim enough
-        return False
-    return data.get("ok") is True and isinstance(data.get("upstreams"), dict)
+        return None
+    if not isinstance(data, dict) or data.get("ok") is not True:
+        return None
+    if not isinstance(data.get("upstreams"), dict):
+        return None
+    return data
+
+
+def health_on_port_any(port: int, timeout: float = 2.0) -> dict[str, Any] | None:
+    """Health probe when the listener's scheme is not known yet."""
+    return (
+        health_on_port(port, timeout=timeout, scheme="https")
+        or health_on_port(port, timeout=timeout, scheme="http")
+    )
+
+
+def reqslim_on_port(
+    port: int, timeout: float = 2.0, *, scheme: str = "http"
+) -> bool:
+    """Whether a reqslim proxy (not some other app) is serving this port."""
+    return health_on_port(port, timeout=timeout, scheme=scheme) is not None
+
+
+def _local_request(
+    port: int,
+    path: str,
+    *,
+    data: bytes | None = None,
+    headers: dict[str, str] | None = None,
+    method: str | None = None,
+    timeout: float = 2.0,
+    scheme: str = "http",
+):
+    """Open a local listener using the configured scheme."""
+    opener = _LOCAL_TLS_OPENER if scheme == "https" else _LOCAL_OPENER
+    request = urllib.request.Request(
+        f"{scheme}://127.0.0.1:{port}{path}",
+        data=data,
+        headers=headers or {},
+        method=method,
+    )
+    return opener.open(request, timeout=timeout)
+
+
+def stop_running_proxy(
+    ports: list[int] | tuple[int, ...],
+    timeout: float = 10.0,
+    *,
+    scheme: str = "http",
+) -> bool:
+    """Ask every reqslim listener on ``ports`` to shut down.
+
+    Returns True when no reqslim health endpoint is left. Used by the installer
+    and uninstaller so a running watcher cannot rewrite restored runtime
+    caches and so a reinstall cannot leave the old upstream mapping in place.
+    """
+    found = False
+    for port in sorted(set(ports)):
+        health = health_on_port(port, scheme=scheme)
+        if health is None:
+            continue
+        found = True
+        try:
+            with _local_request(
+                port,
+                "/v1/shutdown",
+                data=b"",
+                headers={"Content-Length": "0"},
+                method="POST",
+                timeout=2,
+                scheme=scheme,
+            ) as response:
+                response.read()
+        except Exception:  # noqa: BLE001 - an old proxy may not have /shutdown
+            continue
+    if not found:
+        return True
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not any(
+            reqslim_on_port(port, timeout=0.5, scheme=scheme) for port in set(ports)
+        ):
+            return True
+        time.sleep(0.2)
+    return not any(
+        reqslim_on_port(port, timeout=0.5, scheme=scheme) for port in set(ports)
+    )
 
 
 class TableWatcher:
@@ -177,7 +358,7 @@ class TableWatcher:
             return False
         try:
             generate_proxied_table(self.source, self.mapping, self.out)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
             # ``last`` stays unset so the next tick retries; a persistent
             # failure (mapping stale after a big provider-table shuffle)
             # degrades to one log line per poll, not a broken proxy.
@@ -197,7 +378,10 @@ class TableWatcher:
 
     def loop(self, stop: threading.Event, poll_seconds: float) -> None:
         while not stop.wait(poll_seconds):
-            self.tick()
+            try:
+                self.tick()
+            except Exception as exc:  # noqa: BLE001 - never kill the watcher
+                self.log(f"provider table watcher error: {exc}")
 
 
 class CacheWatcher:
@@ -236,7 +420,7 @@ class CacheWatcher:
                 continue
             try:
                 action = rewrite_runtime_cache_file(path, self.mapping)
-            except (OSError, ValueError) as exc:
+            except (OSError, ValueError, TypeError, AttributeError, KeyError) as exc:
                 # Most likely the cloud refresher holds the file mid-write:
                 # drop the signature and try again next tick.
                 self.last.pop(path, None)
@@ -253,7 +437,10 @@ class CacheWatcher:
 
     def loop(self, stop: threading.Event, poll_seconds: float) -> None:
         while not stop.wait(poll_seconds):
-            self.tick()
+            try:
+                self.tick()
+            except Exception as exc:  # noqa: BLE001 - never kill the watcher
+                self.log(f"runtime cache watcher error: {exc}")
 
 
 # ----------------------------------------------------------------------- main
@@ -261,9 +448,57 @@ def run_autostart(args: argparse.Namespace) -> int:
     spec = load_autostart_config(args.autostart_config or default_autostart_config_path())
     record_path = None
     if not args.no_record:
-        record_path = args.record or spec.record or default_record_path()
+        record_path = spec.record or default_record_path()
 
-    mapping = {url: f"http://127.0.0.1:{port}" for port, url in spec.listeners}
+    expected = {str(port): url for port, url in spec.listeners}
+    expected_tls = bool(spec.tls_cert and spec.tls_key)
+    scheme = "https" if expected_tls else "http"
+    ports = [port for port, _ in spec.listeners]
+    health = {port: health_on_port(port, scheme=scheme) for port in ports}
+    if all(item is not None for item in health.values()):
+        if all(
+            item.get("upstreams") == expected and item.get("tls") is expected_tls
+            for item in health.values()
+        ):
+            print("reqslim proxy already running with the same listeners; nothing to do", flush=True)
+            return 0
+        print("reqslim proxy is running with a different listener mapping; restarting it", flush=True)
+        if not stop_running_proxy(ports, scheme=scheme):
+            print(
+                "could not stop the running reqslim proxy; end it manually and try again",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 1
+    else:
+        # An upgrade changes the scheme; an old proxy is still healthy on the
+        # other scheme and would keep the new listeners from binding.
+        stale_scheme = "http" if scheme == "https" else "https"
+        stale = {
+            port: health_on_port(port, scheme=stale_scheme) for port in ports
+        }
+        if any(item is not None for item in stale.values()):
+            print("reqslim is running with the previous transport; restarting it", flush=True)
+            if not stop_running_proxy(ports, scheme=stale_scheme):
+                print(
+                    "could not stop the previous reqslim proxy; end it manually and try again",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return 1
+        elif any(item is not None for item in health.values()):
+            print("reqslim is running on only part of the listener set; restarting it", flush=True)
+            if not stop_running_proxy(ports, scheme=scheme):
+                print(
+                    "could not stop the partial reqslim proxy; end it manually and try again",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return 1
+
+    bind_host = args.host
+    advertised = "127.0.0.1" if bind_host in {"0.0.0.0", "::"} else bind_host
+    mapping = {url: f"{scheme}://{advertised}:{port}" for port, url in spec.listeners}
     proxied = Path(spec.config_dir) / "zcode-builtin.proxied.json"
 
     # Refresh the table before serving: a request that arrives in the first
@@ -281,20 +516,27 @@ def run_autostart(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 - never block startup on the cache
         print(f"runtime cache rewrite failed: {exc}", flush=True)
 
-    served = [port for port, _ in spec.listeners if reqslim_on_port(port)]
-    if len(served) == len(spec.listeners):
-        print("reqslim proxy already running on all listeners; nothing to do", flush=True)
-        return 0
-
+    ttl = spec.ttl if args.ttl == 3600.0 else args.ttl
+    max_cache = spec.max_cache if args.max_cache == 4096 else args.max_cache
+    coalesce_wait = spec.coalesce_wait if args.coalesce_wait == 600.0 else args.coalesce_wait
+    failure_ttl = spec.failure_ttl if args.failure_ttl == 20.0 else args.failure_ttl
     proxy = ZCodeProxy(
         spec.listeners[0][1],
-        coalesce_wait=args.coalesce_wait,
+        ttl=ttl,
+        max_cache=max_cache,
+        cache_enabled=spec.cache_enabled and not args.no_cache,
+        coalesce=spec.coalesce and not args.no_coalesce,
+        coalesce_wait=coalesce_wait,
+        failure_ttl=failure_ttl,
         record_path=record_path,
     )
     try:
-        proxy.serve_many(args.host, list(spec.listeners))
+        tls = (spec.tls_cert, spec.tls_key) if scheme == "https" else None
+        proxy.serve_many(args.host, list(spec.listeners), tls=tls)
     except OSError as exc:
-        partial = any(reqslim_on_port(port) for port, _ in spec.listeners)
+        partial = any(
+            reqslim_on_port(port, scheme=scheme) for port, _ in spec.listeners
+        )
         print(f"\nreqslim could not start: {exc}", file=sys.stderr, flush=True)
         if partial:
             print(
@@ -316,19 +558,29 @@ def run_autostart(args: argparse.Namespace) -> int:
 
     print("reqslim zcode proxy (autostart)", flush=True)
     for port, url in spec.listeners:
-        print(f"  http://{args.host}:{port}  ->  {url}", flush=True)
+        print(f"  {scheme}://{args.host}:{port}  ->  {url}", flush=True)
     print(f"  watching  {spec.zcode_table} (every {spec.poll_seconds:.0f}s)", flush=True)
     print(f"  table ->  {proxied}", flush=True)
     print(f"  caches    {runtime_cache_root()} (every {spec.poll_seconds:.0f}s)", flush=True)
+    print(
+        f"  cache     {'on' if proxy.cache_enabled else 'off'} (ttl {ttl:.0f}s), "
+        f"coalesce {'on' if proxy.coalesce else 'off'}, memo {failure_ttl:.0f}s",
+        flush=True,
+    )
     if record_path:
         print(f"  recording {record_path}", flush=True)
-    print(f"  stats     http://{args.host}:{spec.listeners[0][0]}/v1/stats", flush=True)
-    print(f"  report    http://{args.host}:{spec.listeners[0][0]}/v1/report", flush=True)
+    print(f"  stats     {scheme}://{args.host}:{spec.listeners[0][0]}/v1/stats", flush=True)
+    print(f"  report    {scheme}://{args.host}:{spec.listeners[0][0]}/v1/report", flush=True)
     try:
-        while True:
-            time.sleep(3600)
+        while not proxy.shutdown_event.wait(3600):
+            pass
+        stop.set()
+        proxy.close()
+        print("\nstopped", flush=True)
+        return 0
     except KeyboardInterrupt:
         stop.set()
+        proxy.close()
         print("\nstopped", flush=True)
         return 0
 
@@ -363,10 +615,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--failure-ttl", type=float, default=20.0, help="0 disables the failure memo")
     parser.add_argument("--record", default=None, help="JSONL path (default: ~/.zcode/reqslim/requests.jsonl)")
     parser.add_argument("--no-record", action="store_true")
+    parser.add_argument("--tls-cert", default=None, metavar="PATH", help="serve HTTPS with this certificate")
+    parser.add_argument("--tls-key", default=None, metavar="PATH", help="private key for --tls-cert")
     parser.add_argument("--report", default=None, help="print a report for a JSONL file and exit")
     args = parser.parse_args(argv)
 
     if args.report:
+        if not os.path.isfile(args.report):
+            print(f"report file not found: {args.report}", file=sys.stderr)
+            return 2
         recorder = load_events(args.report)
         print(recorder.format_report())
         return 0
@@ -379,11 +636,17 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit("--autostart takes its record path from autostart.json; use --no-record to disable")
         return run_autostart(args)
 
+    if not 0 < args.port <= 65535:
+        raise SystemExit(f"--port must be 1..65535, got: {args.port}")
+
     record_path = None
     if not args.no_record:
         record_path = args.record or default_record_path()
 
     listeners = parse_listeners(args.listen)
+    if bool(args.tls_cert) != bool(args.tls_key):
+        raise SystemExit("--tls-cert and --tls-key must be given together")
+    tls = (args.tls_cert, args.tls_key) if args.tls_cert else None
     proxy = ZCodeProxy(
         args.upstream,
         ttl=args.ttl,
@@ -396,32 +659,37 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         if listeners:
-            proxy.serve_many(args.host, listeners)
+            proxy.serve_many(args.host, listeners, tls=tls)
         else:
-            proxy.serve(args.host, args.port)
+            proxy.serve(args.host, args.port, tls=tls)
     except OSError as exc:
         print(f"\nreqslim could not start: {exc}", file=sys.stderr, flush=True)
         return 1
 
+    scheme = "https" if tls else "http"
     if listeners:
         print("reqslim zcode proxy", flush=True)
         for port, url in listeners:
-            print(f"  http://{args.host}:{port}  ->  {url}", flush=True)
+            print(f"  {scheme}://{args.host}:{port}  ->  {url}", flush=True)
     else:
-        print(f"reqslim zcode proxy  http://{args.host}:{args.port}  ->  {args.upstream}", flush=True)
+        print(f"reqslim zcode proxy  {scheme}://{args.host}:{args.port}  ->  {args.upstream}", flush=True)
     print(f"  cache     {'on' if not args.no_cache else 'off'} (ttl {args.ttl:.0f}s)", flush=True)
     print(f"  coalesce  {'on' if not args.no_coalesce else 'off'}", flush=True)
     print(f"  memo      {'off' if not args.failure_ttl else f'{args.failure_ttl:.0f}s'}", flush=True)
     if record_path:
         print(f"  recording {record_path}", flush=True)
     stats_port = listeners[0][0] if listeners else args.port
-    print(f"  stats     http://{args.host}:{stats_port}/v1/stats", flush=True)
-    print(f"  report    http://{args.host}:{stats_port}/v1/report", flush=True)
+    print(f"  stats     {scheme}://{args.host}:{stats_port}/v1/stats", flush=True)
+    print(f"  report    {scheme}://{args.host}:{stats_port}/v1/report", flush=True)
     try:
-        while True:
-            time.sleep(3600)
+        while not proxy.shutdown_event.wait(3600):
+            pass
+        print("\nstopped", flush=True)
+        proxy.close()
+        return 0
     except KeyboardInterrupt:
         print("\nstopped", flush=True)
+        proxy.close()
         return 0
 
 

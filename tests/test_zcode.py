@@ -6,15 +6,19 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import os
 import socket
+import ssl
+import stat
 import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -25,22 +29,29 @@ from reqslim.types import LLMResponse
 from reqslim.zcode import (
     Assembler,
     Recorder,
+    RequestComparison,
     ZCodeProxy,
     classify,
+    compare_requests,
     fingerprint,
     normalize_request,
     replay_sse,
 )
-from reqslim.zcode.analytics import Event
+from reqslim.zcode.analytics import Event, load_events
 from reqslim.zcode.__main__ import (
     CacheWatcher,
+    health_on_port,
     load_autostart_config,
+    main as zcode_main,
     reqslim_on_port,
+    stop_running_proxy,
     TableWatcher,
 )
+from reqslim.zcode.tls import _openssl, ensure_tls
 from reqslim.zcode.wiring import (
     generate_proxied_table,
     restore_runtime_caches,
+    rewrite_runtime_cache_file,
     rewrite_runtime_caches,
 )
 
@@ -244,6 +255,23 @@ def post(port: int, payload: dict) -> bytes:
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         return response.read()
+
+
+def post_raw(
+    port: int,
+    path: str,
+    body: bytes,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, str], bytes]:
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    merged = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+    merged.update(headers or {})
+    conn.request("POST", path, body=body, headers=merged)
+    response = conn.getresponse()
+    data = response.read()
+    result = (response.status, dict(response.getheaders()), data)
+    conn.close()
+    return result
 
 
 def _payload(text: str = "审查 doc-01", stream: bool = False, cache_control: int = 0,
@@ -653,6 +681,29 @@ def test_parse_listeners():
 
 
 # ----------------------------------------------------------------- analytics
+def test_analytics_does_not_group_the_same_key_across_upstreams():
+    recorder = Recorder()
+    now = time.time()
+
+    def add(upstream: str, ts: float) -> None:
+        recorder.add(Event(
+            ts=ts, key="same-key", short="same-key", tail="same-tail",
+            kind="tool_turn", model="m", status=200, latency=0.1,
+            est_tokens=10, tokens_in=1, tokens_out=1, hit="",
+            stream=False, n_messages=2, tools=(), upstream=upstream,
+        ))
+
+    add("https://a.example", now)
+    add("https://a.example", now + 1)
+    add("https://b.example", now + 2)
+    summary = recorder.summary()
+    assert summary["duplicates"] == 1, "only the two A requests are duplicates"
+    assert summary["storms"] == 1
+    assert summary["near_duplicates"] == 0
+    clusters = recorder.clusters()
+    assert len(clusters) == 1 and clusters[0]["upstream"] == "https://a.example"
+
+
 def test_analytics_counts_duplicates_and_storms():
     recorder = Recorder()
     now = time.time()
@@ -677,7 +728,107 @@ def test_analytics_counts_duplicates_and_storms():
     assert summary["upstream"] == 2
     assert summary["duplicates"] == 2
     assert summary["storms"] == 2
-    assert "requests" in recorder.format_report()
+    assert summary["comparison"] == {
+        "estimated_requests": 4,
+        "actual_requests": 2,
+        "reduced_requests": 2,
+        "reduction_rate": 50.0,
+        "by_mechanism": {"normalized": 2},
+    }
+    report = recorder.format_report()
+    assert "request reduction" in report
+    assert "estimated requests  4" in report
+    assert "actual requests     2" in report
+    assert "reduced             2  (50.0%)" in report
+    assert "requests        4" in report
+    assert "upstream calls   2" in report
+    assert "cache hits       2  (50.0%)" in report
+
+
+def test_proxy_stats_exposes_the_request_comparison():
+    upstream = FakeUpstream()
+    proxy, server, port = _proxy_with(upstream)
+    try:
+        post(port, _payload("same"))
+        post(port, _payload("same"))
+        expected = {
+            "estimated_requests": 2,
+            "actual_requests": 1,
+            "reduced_requests": 1,
+            "reduction_rate": 50.0,
+            "by_mechanism": {"raw": 1},
+        }
+        stats = proxy.stats()
+        assert stats["requests"] == 2
+        assert stats["upstream"] == 1
+        assert stats["comparison"] == expected
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/stats", timeout=5) as response:
+            http_stats = json.load(response)
+        assert http_stats["comparison"] == expected
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/report", timeout=5) as response:
+            report = response.read().decode("utf-8")
+        assert "request reduction" in report
+        assert "estimated requests  2" in report
+        assert "actual requests     1" in report
+        assert "reduced             1  (50.0%)" in report
+    finally:
+        server.server_close()
+        upstream.stop()
+
+
+def test_request_comparison_is_pure_and_conservation_holds():
+    """Actual + every mechanism must add up to the logical attempts.
+
+    This is the backend invariant the report relies on; an event with a
+    malformed hit value must count as an upstream call, never as a saving.
+    """
+    now = time.time()
+
+    def event(hit):
+        return Event(
+            ts=now, key="k", short="k", tail="t", kind="tool_turn", model="m",
+            status=200, latency=0.1, est_tokens=10, tokens_in=0, tokens_out=0,
+            hit=hit, stream=False, n_messages=1,
+        )
+
+    events = [
+        event(""),
+        event(""),
+        event("raw"),
+        event("normalized"),
+        event("coalesced"),
+        event("failure_memo"),
+        event(None),
+        event(1),
+        event("bogus"),
+        event(" "),
+        event([]),
+        event({}),
+    ]
+    comparison = compare_requests(events)
+    assert isinstance(comparison, RequestComparison)
+    assert comparison.estimated_requests == 12
+    assert comparison.actual_requests == 8, "empty, unknown and malformed hits are upstream calls"
+    assert comparison.reduced_requests == 4
+    assert comparison.reduction_rate == 33.3
+    assert comparison.by_mechanism == {
+        "raw": 1,
+        "normalized": 1,
+        "coalesced": 1,
+        "failure_memo": 1,
+    }
+    assert "bogus" not in comparison.by_mechanism
+    assert sum(comparison.by_mechanism.values()) == comparison.reduced_requests
+    assert comparison.to_dict()["by_mechanism"] == comparison.by_mechanism
+
+    empty = compare_requests([])
+    assert empty.estimated_requests == 0
+    assert empty.actual_requests == 0
+    assert empty.reduced_requests == 0
+    assert empty.reduction_rate == 0.0
+    assert empty.by_mechanism == {}
 
 
 # ------------------------------------------------------- round-2 audit fixes
@@ -761,13 +912,17 @@ def test_l1_is_bounded_by_lru_not_cleared():
     """The raw-hash map must degrade to an LRU, not drop every mapping at once
     (a clear loses the raw attribution for all still-hot keys)."""
     proxy = ZCodeProxy("http://127.0.0.1:1")
-    message = {"type": "message", "content": [{"type": "text", "text": "hi"}]}
+    message = {
+        "type": "message",
+        "content": [{"type": "text", "text": "hi"}],
+        "stop_reason": "end_turn",
+    }
     fp = fingerprint(_payload())
     for index in range(16390):
         proxy._store(f"k{index}", f"raw{index}", fp, message, b"{}", "http://x")
     assert len(proxy._l1) == 16384
-    assert ("http://x", "", "raw0") not in proxy._l1, "oldest entry must be evicted"
-    assert ("http://x", "", "raw16389") in proxy._l1, "newest entry must survive"
+    assert ("http://x", "", "", "raw0") not in proxy._l1, "oldest entry must be evicted"
+    assert ("http://x", "", "", "raw16389") in proxy._l1, "newest entry must survive"
 
 
 def test_oversized_body_is_rejected_without_reading():
@@ -1214,6 +1369,30 @@ def test_restore_runtime_caches_puts_the_originals_back():
         assert not table.with_name(table.name + ".bak-reqslim").exists(), "backup is consumed"
 
 
+def test_runtime_cache_rewrite_is_read_only_and_uninstall_makes_it_writable():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        table = _runtime_cache_dir(root, "3.17.2") / "zcode-builtin.json"
+        _write_table(table, [_table_entry("p1", "https://open.bigmodel.cn/api/anthropic")])
+        assert rewrite_runtime_cache_file(table, MAPPING_BIGMODEL) == "rewritten"
+        assert not (table.stat().st_mode & stat.S_IWUSR), "cloud refresher must not overwrite it"
+        restore_runtime_caches(root=root)
+        assert table.stat().st_mode & stat.S_IWUSR, "uninstall restores a writable file"
+
+
+def test_restore_runtime_caches_uses_inverse_mapping_without_a_backup():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        table = _runtime_cache_dir(root, "3.17.2") / "zcode-builtin.json"
+        _write_table(table, [_table_entry("p1", "http://127.0.0.1:8788")])
+        restored = restore_runtime_caches(
+            root=root,
+            reverse_mapping={"http://127.0.0.1:8788": "https://open.bigmodel.cn/api/anthropic"},
+        )
+        assert restored == [table]
+        assert _read_base_urls(table) == {"p1": "https://open.bigmodel.cn/api/anthropic"}
+
+
 def test_cache_watcher_rewrites_caches_that_zcode_updates_ship():
     """A ZCode update unpacks a NEW version directory with original baseUrls;
     the autostart proxy must rewrite it within one tick (the 3.17.2 lesson)."""
@@ -1236,6 +1415,668 @@ def test_cache_watcher_rewrites_caches_that_zcode_updates_ship():
         assert len(watcher.tick()) == 1, "the freshly shipped version must be rewritten"
         table = _runtime_cache_dir(root, "3.17.2") / "zcode-builtin.json"
         assert _read_base_urls(table) == {"p1": "http://127.0.0.1:8788"}
+
+
+# ------------------------------------------------ third-round correctness fixes
+def _proxy_with(upstream: FakeUpstream) -> tuple[ZCodeProxy, ThreadingHTTPServer, int]:
+    proxy = ZCodeProxy(f"http://127.0.0.1:{upstream.port}")
+    server = proxy.serve(port=0)
+    return proxy, server, server.server_address[1]
+
+
+def test_authorization_and_api_key_are_forwarded():
+    seen: dict[str, str | None] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            return
+
+        def do_POST(self):
+            seen["authorization"] = self.headers.get("Authorization")
+            seen["x-api-key"] = self.headers.get("x-api-key")
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            body = json.dumps(THINKING_MESSAGE, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    proxy = ZCodeProxy(f"http://127.0.0.1:{upstream.server_address[1]}")
+    server = proxy.serve(port=0)
+    try:
+        status, _headers, _body = post_raw(
+            server.server_address[1],
+            "/v1/messages",
+            json.dumps(_payload()).encode(),
+            {"Authorization": "Bearer test-token", "x-api-key": "test-key"},
+        )
+        assert status == 200
+        assert seen["authorization"] == "Bearer test-token"
+        assert seen["x-api-key"] == "test-key"
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def test_chunked_request_body_is_accepted():
+    upstream = FakeUpstream()
+    proxy, server, port = _proxy_with(upstream)
+    try:
+        body = json.dumps(_payload()).encode()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request(
+            "POST",
+            "/v1/messages",
+            body=iter([body]),
+            headers={"Content-Type": "application/json"},
+            encode_chunked=True,
+        )
+        response = conn.getresponse()
+        assert response.status == 200
+        assert b"msg_fake" in response.read()
+        conn.close()
+        assert upstream.calls == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_non_object_request_body_is_a_400_not_a_disconnect():
+    upstream = FakeUpstream()
+    proxy, server, port = _proxy_with(upstream)
+    try:
+        status, _headers, body = post_raw(port, "/v1/messages", b"[]")
+        assert status == 400
+        assert b"JSON object" in body
+        assert upstream.calls == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_non_object_200_is_forwarded_and_recorded_not_crashing():
+    upstream = FakeUpstream(raw_body=b"[]", content_type="application/json")
+    proxy, server, port = _proxy_with(upstream)
+    try:
+        for _ in range(2):
+            status, _headers, body = post_raw(port, "/v1/messages", json.dumps(_payload()).encode())
+            assert status == 200 and body == b"[]"
+        assert upstream.calls == 2, "an unusable 200 must not be cached"
+        assert proxy.cache.size() == 0
+        assert [event.status for event in proxy.recorder.events] == [200, 200]
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_unsupported_path_closes_instead_of_poisoning_keepalive():
+    upstream = FakeUpstream()
+    proxy, server, port = _proxy_with(upstream)
+    try:
+        status, _headers, _body = post_raw(port, "/not-messages", b'{"padding":"' + b"x" * 200 + b'"}')
+        assert status == 404
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request(
+            "POST",
+            "/not-messages",
+            body=b'{"padding":"' + b"x" * 200 + b'"}',
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        response.read()
+        try:
+            conn.request(
+                "POST",
+                "/v1/messages",
+                body=json.dumps(_payload()).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            second = conn.getresponse()
+            assert second.status != 501, "the unread body must not become a request line"
+        except (ConnectionError, http.client.HTTPException):
+            pass
+        finally:
+            conn.close()
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_malformed_sse_is_recorded_as_502_and_does_not_kill_the_client():
+    sse = (
+        b'event: message_start\n'
+        b'data: {"type":"message_start","message":{"id":"m","type":"message",'
+        b'"role":"assistant","model":"x","content":[],"stop_reason":null,'
+        b'"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+        b'event: content_block_start\n'
+        b'data: {"type":"content_block_start","index":null,'
+        b'"content_block":{"type":"text","text":""}}\n\n'
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    )
+    upstream = FakeUpstream(raw_body=sse, content_type="text/event-stream")
+    proxy, server, port = _proxy_with(upstream)
+    try:
+        body = post(port, _payload(stream=True))
+        assert b"proxy_error" in body, "the client must see an explicit error event"
+        assert [event.status for event in proxy.recorder.events] == [502]
+        assert proxy.cache.size() == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_invalid_content_block_is_never_cached():
+    message = {
+        "id": "m", "type": "message", "role": "assistant", "model": "x",
+        "content": ["not-a-block"], "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    upstream = FakeUpstream(message=message)
+    proxy, server, port = _proxy_with(upstream)
+    try:
+        status, _headers, _body = post_raw(port, "/v1/messages", json.dumps(_payload()).encode())
+        assert status == 200
+        assert proxy.cache.size() == 0, "a non-dict content block must not poison the cache"
+        assert upstream.calls == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_stream_without_stop_reason_is_not_cached():
+    sse = (
+        b'event: message_start\n'
+        b'data: {"type":"message_start","message":{"id":"m","type":"message",'
+        b'"role":"assistant","model":"x","content":[],"stop_reason":null,'
+        b'"usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+        b'event: content_block_start\n'
+        b'data: {"type":"content_block_start","index":0,'
+        b'"content_block":{"type":"text","text":""}}\n\n'
+        b'event: content_block_delta\n'
+        b'data: {"type":"content_block_delta","index":0,'
+        b'"delta":{"type":"text_delta","text":"done"}}\n\n'
+        b'event: content_block_stop\n'
+        b'data: {"type":"content_block_stop","index":0}\n\n'
+        b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    )
+    upstream = FakeUpstream(raw_body=sse, content_type="text/event-stream")
+    proxy, server, port = _proxy_with(upstream)
+    try:
+        post(port, _payload(stream=True))
+        post(port, _payload(stream=True))
+        assert upstream.calls == 2, "a null stop_reason must not be replayed"
+        assert proxy.cache.size() == 0
+        assert all(event.status == 502 for event in proxy.recorder.events)
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_stream_request_receiving_json_200_is_a_controlled_error():
+    upstream = FakeUpstream(
+        raw_body=b'{"error":{"type":"overloaded_error"}}',
+        content_type="application/json",
+    )
+    proxy, server, port = _proxy_with(upstream)
+    try:
+        status, headers, _body = post_raw(
+            port, "/v1/messages", json.dumps(_payload(stream=True)).encode()
+        )
+        assert status == 502
+        assert headers.get("Content-Type", "").startswith("application/json"), headers
+        assert [event.status for event in proxy.recorder.events] == [502]
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_upstream_content_type_and_retry_after_are_forwarded():
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args):
+            return
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            body = b"gateway HTML"
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Retry-After", "37")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    proxy = ZCodeProxy(f"http://127.0.0.1:{upstream.server_address[1]}")
+    server = proxy.serve(port=0)
+    try:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_address[1]}/v1/messages",
+            data=json.dumps(_payload()).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            urllib.request.urlopen(request, timeout=10)
+            raise AssertionError("expected 502")
+        except urllib.error.HTTPError as exc:
+            assert exc.code == 502
+            assert exc.headers.get("Content-Type") == "text/plain"
+            assert exc.headers.get("Retry-After") == "37"
+            assert exc.read() == b"gateway HTML"
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def test_normalization_keeps_cache_control_inside_tool_inputs_and_schemas():
+    first = _payload()
+    second = _payload()
+    first["messages"][1]["content"][0]["input"] = {"cache_control": {"ttl": 60}}
+    second["messages"][1]["content"][0]["input"] = {"cache_control": {"ttl": 999}}
+    assert fingerprint(first).key != fingerprint(second).key, "tool input is content"
+
+    first = _payload()
+    second = _payload()
+    first["tools"][0]["input_schema"] = {"type": "object", "properties": {"cache_control": {"type": "string"}}}
+    second["tools"][0]["input_schema"] = {"type": "object", "properties": {"cache_control": {"type": "integer"}}}
+    assert fingerprint(first).key != fingerprint(second).key, "tool schema is content"
+
+    upstream = FakeUpstream()
+    proxy, server, port = _proxy_with(upstream)
+    try:
+        post(port, first)
+        post(port, second)
+        assert upstream.calls == 2, "different tool schemas must not share a cache entry"
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_credentials_partition_cache_and_coalescing():
+    upstream = FakeUpstream()
+    proxy, server, port = _proxy_with(upstream)
+    body = json.dumps(_payload()).encode()
+    try:
+        for key in ("account-a", "account-b"):
+            post_raw(port, "/v1/messages", body, {"x-api-key": key})
+        assert upstream.calls == 2, "different accounts must not share a reply"
+        post_raw(port, "/v1/messages", body, {"x-api-key": "account-a"})
+        assert upstream.calls == 2, "the same account still hits its own cache"
+        assert proxy.stats()["hits"] == {"raw": 1}
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_coalesced_followers_are_attributed_as_coalesced():
+    upstream = FakeUpstream(delay=0.4)
+    proxy, server, port = _proxy_with(upstream)
+    outcomes: list[int] = []
+    lock = threading.Lock()
+
+    def worker():
+        try:
+            post(port, _payload())
+            with lock:
+                outcomes.append(200)
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                outcomes.append(getattr(exc, "code", type(exc).__name__))
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        assert outcomes == [200] * 4
+        assert upstream.calls == 1
+        assert proxy.stats()["hits"] == {"coalesced": 3}
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_non_retryable_errors_are_shared_by_coalescing():
+    upstream = FakeUpstream(delay=0.15, fail_status=400)
+    proxy, server, port = _proxy_with(upstream)
+    outcomes: list[int] = []
+    lock = threading.Lock()
+
+    def worker():
+        try:
+            post(port, _payload())
+            with lock:
+                outcomes.append(200)
+        except urllib.error.HTTPError as exc:
+            with lock:
+                outcomes.append(exc.code)
+
+    threads = [threading.Thread(target=worker) for _ in range(3)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        assert outcomes == [400, 400, 400]
+        assert upstream.calls == 1, "a deterministic client error should not be re-sent"
+        assert proxy.stats()["hits"] == {"coalesced": 2}
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_oversized_response_is_still_shared_by_coalescing():
+    upstream = FakeUpstream(delay=0.4)
+    proxy, server, port = _proxy_with(upstream)
+    payload = _payload()
+    payload["messages"][0]["content"][0]["text"] = "x" * 1_200_000
+    outcomes: list[int] = []
+    lock = threading.Lock()
+
+    def worker():
+        try:
+            post(port, payload)
+            with lock:
+                outcomes.append(200)
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                outcomes.append(getattr(exc, "code", type(exc).__name__))
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        assert outcomes == [200, 200]
+        assert upstream.calls == 1, "over the cache limit, handoff must still coalesce"
+        assert proxy.stats()["hits"] == {"coalesced": 1}
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_count_tokens_path_is_forwarded():
+    upstream = FakeUpstream()
+    proxy, server, port = _proxy_with(upstream)
+    try:
+        status, _headers, body = post_raw(
+            port, "/v1/messages/count_tokens", json.dumps(_payload()).encode()
+        )
+        assert status == 200
+        assert b"msg_fake" in body
+        assert upstream.calls == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        upstream.stop()
+
+
+def test_runtime_cache_reinstall_rebases_from_the_pristine_backup():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        table = _runtime_cache_dir(root, "3.17.2") / "zcode-builtin.json"
+        _write_table(table, [_table_entry("p1", "https://open.bigmodel.cn/api/anthropic")])
+        original = table.read_text(encoding="utf-8")
+        first = {"https://open.bigmodel.cn/api/anthropic": "http://127.0.0.1:8788"}
+        second = {"https://open.bigmodel.cn/api/anthropic": "http://127.0.0.1:8799"}
+        assert rewrite_runtime_cache_file(table, first) == "rewritten"
+        assert _read_base_urls(table) == {"p1": "http://127.0.0.1:8788"}
+        assert rewrite_runtime_cache_file(table, second) == "rewritten"
+        assert _read_base_urls(table) == {"p1": "http://127.0.0.1:8799"}
+        assert rewrite_runtime_cache_file(table, second) == "untouched"
+        assert table.with_name(table.name + ".bak-reqslim").read_text(encoding="utf-8") == original
+
+
+def test_malformed_provider_table_is_unreadable_not_a_crash():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        table = _runtime_cache_dir(root, "3.17.2") / "zcode-builtin.json"
+        table.write_text("[]", encoding="utf-8")
+        assert rewrite_runtime_cache_file(table, MAPPING_BIGMODEL) == "unreadable"
+        assert CacheWatcher(MAPPING_BIGMODEL, root=root).tick() == []
+        assert TableWatcher(table, MAPPING_BIGMODEL, root / "out.json").tick() is False
+
+
+def test_recorder_rotation_stays_under_the_byte_budget():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "requests.jsonl")
+        recorder = Recorder(path=path, max_bytes=1000)
+        event = Event(
+            ts=time.time(), key="k" * 100, short="k", tail="t", kind="tool_turn",
+            model="m", status=200, latency=0.01, est_tokens=100,
+            tokens_in=0, tokens_out=0, hit="", stream=False,
+            n_messages=1, tools=(),
+        )
+        peak = 0
+        for _ in range(25):
+            recorder.add(event)
+            peak = max(peak, os.path.getsize(path))
+        assert peak <= 1000, f"rotation must keep the current file bounded, peak={peak}"
+        assert os.path.exists(path + ".1")
+
+
+def test_offline_report_loads_more_than_the_live_window():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "requests.jsonl"
+        event = Event(
+            ts=time.time(), key="k", short="k", tail="t", kind="tool_turn",
+            model="m", status=200, latency=0.01, est_tokens=1,
+            tokens_in=0, tokens_out=0, hit="", stream=False,
+            n_messages=1, tools=(),
+        )
+        line = event.to_json() + "\n"
+        with open(path, "w", encoding="utf-8") as handle:
+            for _ in range(50005):
+                handle.write(line)
+        recorder = load_events(str(path))
+        assert len(recorder.events) == 50005
+        assert recorder.summary()["requests"] == 50005
+
+
+def test_offline_report_skips_malformed_records_without_losing_valid_ones():
+    """A crash-truncated line or a hand-edited field must not kill --report."""
+    now = time.time()
+    valid = Event(
+        ts=now, key="k", short="k", tail="t", kind="tool_turn", model="m",
+        status=200, latency=0.1, est_tokens=10, tokens_in=1, tokens_out=1,
+        hit="", stream=False, n_messages=1,
+    )
+    payload = json.loads(valid.to_json())
+    cache_hit = {**payload, "hit": "raw"}
+    unknown_hit = {**payload, "hit": "bogus"}
+    null_hit = {**payload, "hit": None}
+    list_hit = {**payload, "hit": []}
+    bad_tools = {**payload, "tools": 5}
+    bad_tokens = {**payload, "tokens_in": None}
+    bad_stream = {**payload, "stream": "yes"}
+    bad_number = {**payload, "tokens_in": 1e999}
+    bad_ts = {**payload, "ts": float("nan")}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "requests.jsonl"
+        lines = [
+            valid.to_json(),
+            json.dumps(cache_hit),
+            json.dumps(unknown_hit),
+            json.dumps(null_hit),
+            json.dumps(list_hit),
+            json.dumps(bad_tools),
+            json.dumps(bad_tokens),
+            json.dumps(bad_stream),
+            json.dumps(bad_number),
+            json.dumps(bad_ts),
+            "[]",
+        ]
+        with open(path, "wb") as handle:
+            handle.write(("\n".join(lines) + "\n").encode("utf-8"))
+            handle.write(b"\xff\xfe\n")  # truncated multibyte tail
+        recorder = load_events(str(path))
+        assert len(recorder.events) == 5, "valid, unknown and non-string-hit records survive"
+        summary = recorder.summary()
+        assert summary["requests"] == 5
+        assert summary["upstream"] == 4, "non-string hit labels are upstream calls"
+        assert summary["comparison"] == {
+            "estimated_requests": 5,
+            "actual_requests": 4,
+            "reduced_requests": 1,
+            "reduction_rate": 20.0,
+            "by_mechanism": {"raw": 1},
+        }
+        assert "request reduction" in recorder.format_report()
+
+
+def test_missing_report_file_is_an_error():
+    missing = str(Path(tempfile.gettempdir()) / "reqslim-no-such-report.jsonl")
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = zcode_main(["--report", missing])
+    assert code == 2
+    assert "not found" in err.getvalue()
+
+
+def test_autostart_config_carries_proxy_options():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "autostart.json"
+        path.write_text(json.dumps({
+            "listeners": [[8788, "https://a.example/x"]],
+            "record": "r.jsonl",
+            "zcode_table": "t.json",
+            "config_dir": tmp,
+            "poll_seconds": 5,
+            "ttl": 30,
+            "max_cache": 12,
+            "cache": False,
+            "coalesce": False,
+            "coalesce_wait": 2,
+            "failure_ttl": 0,
+        }), encoding="utf-8")
+        spec = load_autostart_config(str(path))
+        assert spec.ttl == 30 and spec.max_cache == 12
+        assert spec.cache_enabled is False and spec.coalesce is False
+        assert spec.coalesce_wait == 2 and spec.failure_ttl == 0
+
+
+def test_stop_running_proxy_closes_the_listeners():
+    upstream = FakeUpstream()
+    proxy, server, port = _proxy_with(upstream)
+    try:
+        assert health_on_port(port) is not None
+        assert stop_running_proxy([port], timeout=5) is True
+        time.sleep(0.2)
+        assert health_on_port(port) is None
+    finally:
+        server.server_close()
+        upstream.stop()
+
+
+def test_signing_handshake_is_forwarded_to_provider_origin():
+    """ZCode's signer posts to /api/paas/... on the provider *origin*.
+
+    The upstream URL carries ``/api/anthropic``; blindly appending the
+    handshake path would produce ``/api/anthropic/api/paas/...`` and the
+    gateway would answer 404 before any signed request could start.
+    """
+    seen: dict[str, str] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args) -> None:
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            self.rfile.read(length)
+            seen["path"] = self.path
+            seen["authorization"] = self.headers.get("Authorization", "")
+            body = b'{"code":200,"data":{"privateCipher":"cipher"}}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    upstream_url = f"http://127.0.0.1:{upstream.server_address[1]}/api/anthropic"
+    proxy = ZCodeProxy(upstream_url)
+    servers = proxy.serve_many("127.0.0.1", [(0, upstream_url)])
+    port = servers[0].server_address[1]
+    try:
+        status, _, body = post_raw(
+            port,
+            "/api/paas/c1f3a7e2/v2/client",
+            b'{"nonce":"n","sig":"s","ts":"1"}',
+            {"Authorization": "Bearer account-token"},
+        )
+        assert status == 200, status
+        assert body == b'{"code":200,"data":{"privateCipher":"cipher"}}'
+        assert seen["path"] == "/api/paas/c1f3a7e2/v2/client", seen
+        assert seen["authorization"] == "Bearer account-token", seen
+        assert proxy.recorder.summary()["requests"] == 0, "handshake must not be cached/recorded"
+    finally:
+        proxy.close()
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def test_tls_listener_serves_https_health():
+    """The installer's HTTPS listener must be usable by a TLS client.
+
+    ZCode's signer refuses HTTP; this exercises the exact transport the
+    provider table will point at, including a certificate with 127.0.0.1 in
+    its SAN.
+    """
+    if _openssl() is None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tls = ensure_tls(Path(tmp))
+        proxy = ZCodeProxy("http://127.0.0.1:1")
+        servers = proxy.serve_many(
+            "127.0.0.1",
+            [(0, "http://127.0.0.1:1")],
+            tls=(str(tls.cert), str(tls.key)),
+        )
+        port = servers[0].server_address[1]
+        try:
+            context = ssl._create_unverified_context()
+            conn = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=5)
+            conn.request("GET", "/v1/health")
+            response = conn.getresponse()
+            data = json.loads(response.read())
+            conn.close()
+            assert response.status == 200
+            assert data["ok"] is True
+            assert data["tls"] is True
+            assert health_on_port(port, scheme="https") is not None
+        finally:
+            proxy.close()
 
 
 if __name__ == "__main__":

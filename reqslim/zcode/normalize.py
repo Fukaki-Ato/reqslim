@@ -46,8 +46,11 @@ VOLATILE_TOP = frozenset(
     }
 )
 
-#: Fields that are transport or billing hints, not prompt content.
-VOLATILE_ANYWHERE = frozenset({"cache_control", "cache_creation", "ephemeral_5m"})
+#: Fields stripped only from the positions the Anthropic protocol defines as
+#: transport hints. They must not be removed from arbitrary tool inputs or
+#: schemas: a tool may legitimately receive a JSON key with this name.
+_CACHE_CONTROL = "cache_control"
+_SCOPE_HEADERS = frozenset({"authorization", "x-api-key", "anthropic-version"})
 
 #: Anchored to the wording the shipped ZCode runtime actually sends (verified
 #: against ``zcode.cjs``): the compaction instruction is "Your task is to create
@@ -63,17 +66,75 @@ _COMPACTION_HINT = re.compile(
 )
 
 
-def _scrub(value: Any) -> Any:
-    """Deep copy dropping volatile fields, so the caller's payload is untouched."""
+def _copy(value: Any) -> Any:
+    """Deep copy, preserving every field the caller sent."""
     if isinstance(value, Mapping):
-        return {
-            key: _scrub(item)
-            for key, item in value.items()
-            if key not in VOLATILE_ANYWHERE
-        }
+        return {key: _copy(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [_scrub(item) for item in value]
+        return [_copy(item) for item in value]
     return value
+
+
+def _strip_block(block: Any) -> Any:
+    """Copy a content block and drop only the protocol-level cache marker.
+
+    ``cache_control`` is valid on content blocks, but a tool input or schema
+    is arbitrary JSON: a key with the same name there is content, not a
+    transport hint. Only tool_result's nested *blocks* are cleaned, never its
+    text payload.
+    """
+    clean = _copy(block)
+    if not isinstance(clean, Mapping):
+        return clean
+    clean.pop(_CACHE_CONTROL, None)
+    if clean.get("type") == "tool_result":
+        content = clean.get("content")
+        if isinstance(content, list):
+            clean["content"] = [
+                _strip_block(item) if isinstance(item, Mapping) else item
+                for item in content
+            ]
+    return clean
+
+
+def canonical_system(system: Any) -> Any:
+    """Canonical system prompt, preserving non-text blocks.
+
+    Text-only system prompts keep their old string shape (a string and a list
+    of text blocks still collide), because that is how ZCode churns. Anything
+    else -- images, documents, unknown block types -- is kept verbatim, since
+    dropping it could make two different prompts share a cache key.
+    """
+    if system is None:
+        return ""
+    if isinstance(system, str):
+        return system
+    if isinstance(system, Mapping):
+        return _strip_block(system)
+    if not isinstance(system, (list, tuple)):
+        return system
+
+    blocks: list[Any] = []
+    for block in system:
+        if isinstance(block, str):
+            blocks.append({"type": "text", "text": block})
+        elif isinstance(block, Mapping):
+            clean = _strip_block(block)
+            if clean.get("type") == "text" and isinstance(clean.get("text"), str):
+                blocks.append({"type": "text", "text": clean["text"]})
+            else:
+                blocks.append(clean)
+        else:
+            blocks.append(block)
+    if blocks and all(
+        isinstance(block, dict)
+        and set(block) == {"type", "text"}
+        and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+        for block in blocks
+    ):
+        return "\n".join(block["text"] for block in blocks)
+    return blocks
 
 
 def system_text(system: Any) -> str:
@@ -96,7 +157,13 @@ def system_text(system: Any) -> str:
 def canonical_tools(tools: Any) -> list[dict[str, Any]]:
     if not tools:
         return []
-    cleaned = [_scrub(tool) for tool in tools if isinstance(tool, Mapping)]
+    cleaned: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, Mapping):
+            continue
+        clean = _copy(tool)
+        clean.pop(_CACHE_CONTROL, None)  # tool-level breakpoint only
+        cleaned.append(clean)
     cleaned.sort(key=lambda tool: str(tool.get("name", "")))
     return cleaned
 
@@ -117,13 +184,13 @@ def canonical_messages(messages: Any) -> list[dict[str, Any]]:
                 if not isinstance(block, Mapping):
                     blocks.append(block)
                     continue
-                clean = _scrub(block)
+                clean = _strip_block(block)
                 kind = clean.get("type")
                 if kind == "tool_use":
                     clean.pop("id", None)
                 elif kind == "tool_result":
-                    # ``_scrub`` above already recursed through the nested
-                    # content, so cache_control inside it is gone too.
+                    # ``_strip_block`` cleaned the block and its nested
+                    # content blocks; the payload itself stays verbatim.
                     clean.pop("tool_use_id", None)
                 blocks.append(clean)
         else:
@@ -138,8 +205,8 @@ def normalize_request(payload: Mapping[str, Any]) -> dict[str, Any]:
     for key, value in payload.items():
         if key in VOLATILE_TOP:
             continue
-        canonical[key] = _scrub(value)
-    canonical["system"] = system_text(payload.get("system"))
+        canonical[key] = _copy(value)
+    canonical["system"] = canonical_system(payload.get("system"))
     canonical["tools"] = canonical_tools(payload.get("tools"))
     canonical["messages"] = canonical_messages(payload.get("messages"))
     return canonical
@@ -162,10 +229,30 @@ class Fingerprint:
     n_messages: int
     kind: str
     beta: str = ""
+    upstream: str = ""
+    scope: str = ""
 
     @property
     def short(self) -> str:
         return self.key[:12]
+
+
+def header_scope(headers: Mapping[str, str]) -> str:
+    """Hash the headers that can change an account's answer.
+
+    Credentials are never logged: the digest only partitions cache entries,
+    coalescing and the failure memo. Two providers on the same gateway with
+    different keys must not share replies, and an API-version change may also
+    change the answer.
+    """
+    parts: list[str] = []
+    for name, value in headers.items():
+        lower = name.lower()
+        if lower in _SCOPE_HEADERS and value:
+            parts.append(f"{lower}={value}")
+    if not parts:
+        return ""
+    return hashlib.sha256("\n".join(sorted(parts)).encode("utf-8")).hexdigest()[:16]
 
 
 def beta_tag(headers: Mapping[str, str]) -> str:
@@ -230,7 +317,7 @@ def classify(payload: Mapping[str, Any]) -> str:
     return "continuation"
 
 
-def fingerprint(payload: Mapping[str, Any], beta: str = "") -> Fingerprint:
+def fingerprint(payload: Mapping[str, Any], beta: str = "", upstream: str = "", scope: str = "") -> Fingerprint:
     canonical = normalize_request(payload)
     if beta:
         canonical["anthropic_beta"] = beta
@@ -246,6 +333,8 @@ def fingerprint(payload: Mapping[str, Any], beta: str = "") -> Fingerprint:
         n_messages=len(messages),
         kind=classify(payload),
         beta=beta,
+        upstream=upstream,
+        scope=scope,
     )
 
 

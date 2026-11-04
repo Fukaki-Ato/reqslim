@@ -16,11 +16,14 @@ Read the traffic report:
 from __future__ import annotations
 
 from .analytics import Event, Recorder, load_events
+from .comparison import RequestComparison, compare_requests, is_local_hit
 from .normalize import (
     Fingerprint,
     beta_tag,
+    canonical_system,
     classify,
     fingerprint,
+    header_scope,
     normalize_request,
     system_text,
     tool_names,
@@ -33,11 +36,16 @@ __all__ = [
     "Event",
     "Fingerprint",
     "Recorder",
+    "RequestComparison",
     "ZCodeProxy",
     "beta_tag",
+    "canonical_system",
     "classify",
+    "compare_requests",
     "fingerprint",
     "has_thinking",
+    "header_scope",
+    "is_local_hit",
     "load_events",
     "normalize_request",
     "replay_sse",

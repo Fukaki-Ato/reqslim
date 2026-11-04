@@ -16,6 +16,7 @@ echo.
 if not exist "tools\install_zcode.py" goto :wrong_dir
 
 set "DRY="
+set "UNINSTALL="
 call :scan_dry %*
 
 rem Find an interpreter that actually runs. `where python` is not enough: on a
@@ -47,6 +48,7 @@ echo.
 if errorlevel 1 goto :failed
 
 :installed
+if defined UNINSTALL goto :uninstalled
 if defined DRY goto :dry_done
 if not exist "start-zcode.bat" goto :failed
 echo.
@@ -57,7 +59,7 @@ call "start-zcode.bat"
 if errorlevel 1 goto :launch_failed
 echo.
 echo   已启动：代理在独立窗口里运行，ZCode 正常打开。
-echo   看数据：双击 zcode-stats.bat，或打开 http://127.0.0.1:8788/v1/report
+echo   看数据：双击 zcode-stats.bat，或打开 https://127.0.0.1:8788/v1/report
 timeout /t 6 /nobreak >nul
 exit /b 0
 
@@ -71,6 +73,13 @@ exit /b 1
 :dry_done
 echo.
 echo   dry run 完成，没有写任何文件。
+echo.
+pause
+exit /b 0
+
+:uninstalled
+echo.
+echo   已卸载 reqslim：自启项、环境变量和运行时缓存已还原。
 echo.
 pause
 exit /b 0
@@ -122,5 +131,6 @@ exit /b 0
 :scan_dry
 if "%~1"=="" exit /b 0
 if /i "%~1"=="--dry-run" set "DRY=1"
+if /i "%~1"=="--uninstall" set "UNINSTALL=1"
 shift
 goto :scan_dry

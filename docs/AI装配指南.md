@@ -12,7 +12,7 @@
 
 在一台**装有 ZCode 的新设备**上，把 reqslim 代理装到 ZCode 前面：
 
-- ZCode 的所有 `anthropic-messages` 协议请求改走本地代理（改写 provider 表副本、环境变量与运行时缓存表，均留备份；不改 ZCode 安装目录、不改用户设置、不碰登录凭据）；
+- ZCode 的所有 `anthropic-messages` 协议请求改走本地 HTTPS 代理（改写 provider 表副本、环境变量与运行时缓存表，均留备份；不改 ZCode 安装目录、不改 ZCode 用户设置、不碰登录凭据（会设置两个用户级环境变量））；
 - 代理按**上游网关**分端口监听（默认从 8788 递增），一个进程管所有端口；
 - 验收标准：ZCode 回答内容不变、`/v1/health` 可达、`requests.jsonl` 随真实使用增长。
 
@@ -23,9 +23,11 @@
 | P1 | Python ≥ 3.9 可用 | `python -c "import sys; assert sys.version_info >= (3, 9); print(sys.version)"` | 打印版本号，无异常 |
 | P2 | ZCode 已安装且含 provider 表 | 步骤 2 的探测 | 找到 `config/provider/zcode-builtin.json` |
 | P3 | 可达目标上游网关 | `python -c "import urllib.request; print(urllib.request.urlopen('https://open.bigmodel.cn', timeout=10).status)"` | 任何 HTTP 状态码（能建连即可） |
+| P4 | OpenSSL 可用（生成本机 HTTPS 证书） | `openssl version` | 打印版本号；Windows 通常由 Git for Windows 提供 |
 
 P1 失败 → 停下，要求用户安装 Python 3.9+（Windows 安装时勾选 *Add python.exe to PATH*）。
 P3 失败 → 停下报告网络问题，不要继续（代理装上了也打不通上游）。
+P4 失败 → 安装 Git for Windows/OpenSSL；仅当目标 ZCode 低于 3.17 时才可改用 `--no-tls`。
 
 ### 0.3 禁止假设（每条都对应一次真实翻车）
 
@@ -35,6 +37,7 @@ P3 失败 → 停下报告网络问题，不要继续（代理装上了也打不
 4. **不要假设 provider 表里只有一种上游**——先读表（步骤 1）再决定参数；漏掉的上游会绕过代理直连。
 5. **不要假设 8788–8792 空闲**——Windows 上 Hyper-V/WSL 会保留动态端口段；绑定失败时换 `--port` 重装。
 6. **不要手动编辑 `start-zcode.bat`、`zcode-builtin.proxied.json`**——它们是安装器的产物，下次安装会被整体覆盖；要改行为就改安装参数重跑安装器。
+7. **不要用 `--no-tls` 糊弄 3.17+ 套餐账号**——签名层要求 HTTPS，HTTP 监听会让请求在发出前失败（`ClientRequestSigningV4Error`），且 `requests` 不会增长。
 
 ### 0.4 输入变量（执行中逐步确定，代入后续步骤）
 
@@ -98,7 +101,7 @@ POSIX 候选：
 ```
 $ZCODE_HOME
 /Applications/ZCode.app/Contents/Resources
-/opt/Zcode/resources   /opt/zcode/resources   /usr/lib/zcode/resources
+/opt/ZCode/resources   /opt/zcode/resources   /usr/lib/zcode/resources
 ~/Applications/ZCode.app/Contents/Resources
 ```
 
@@ -115,7 +118,7 @@ if os.name == "nt":
                    Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "ZCode"]
 else:
     candidates += ["/Applications/ZCode.app/Contents/Resources",
-                   "/opt/Zcode/resources", "/opt/zcode/resources",
+                   "/opt/ZCode/resources", "/opt/zcode/resources",
                    "/usr/lib/zcode/resources"]
 for root in candidates:
     root = Path(root)
@@ -195,7 +198,7 @@ python tools/install_zcode.py \
 **预期**：输出含
 
 ```
-listen      127.0.0.1:8788  ->  <主上游>
+listen      https://127.0.0.1:8788  ->  <主上游>
             <被改写的 providerId 列表>
 uncovered   ...             ← 若还有上游没接进来
 dry run: nothing written
@@ -219,9 +222,10 @@ dry run: nothing written
 | 改写后的 provider 表 | `~/.zcode/reqslim/zcode-builtin.proxied.json` | 环境变量指向的回落表：缓存尚未生成的新机器/新版本读它 |
 | 运行时缓存表改写 | `~/.zcode/v2/runtime/provider/*/*/endpoint-*/zcode-builtin.json` | agent 宿主**优先读取**的表（asar 证实，环境变量只是回落）；原件备份同目录 `.bak-reqslim`，卸载时还原 |
 | 原表备份副本 | `~/.zcode/reqslim/zcode-builtin.original.json` | 仅供 diff 参考，运行时不读 |
-| 自启配置 | `~/.zcode/reqslim/autostart.json` | `--autostart` 模式读：监听表、记录路径、ZCode 表路径 |
+| 本机 TLS 材料 | `~/.zcode/reqslim/tls/` | 私有 CA、`127.0.0.1` 证书、`ca-bundle.pem`；由 `ZCODE_AGENT_CA_CERT` 提供给 ZCode |
+| 自启配置 | `~/.zcode/reqslim/autostart.json` | `--autostart` 模式读：监听表、记录路径、ZCode 表路径、TLS 证书路径 |
 | 无窗口代理入口 | `~/.zcode/reqslim/proxy_autostart.pyw` | pythonw 启动，日志重定向 `proxy.log` |
-| 启动项（仅 Windows） | 启动文件夹 `reqslim proxy.lnk` | 登录自动起代理；用户级环境变量由 `setx` 写入 |
+| 启动项（仅 Windows） | 启动文件夹 `reqslim proxy.lnk` | 登录自动起代理；两个用户级环境变量由 `setx` 写入 |
 | 手动启动器 | `$REQSLIM/start-zcode.bat`（POSIX 为 `start-zcode.sh`） | 兜底：设环境变量 + 起代理 + 起 ZCode |
 | 查数助手（仅 Windows） | `$REQSLIM/zcode-stats.bat`、`zcode-report.bat` | 双击看报告 |
 
@@ -235,6 +239,16 @@ python -c "import json; d=json.load(open(r'<HOME>/.zcode/reqslim/zcode-builtin.p
 ```
 
 再跑一次 `python tools/install_zcode.py --dry-run`：所有运行时缓存表应显示 `untouched`（首次安装为 rewritten），说明 agent 宿主实际优先读取的缓存层也已接上。
+
+确认 TLS 材料与环境变量：
+
+```bash
+python -c "import os; p=os.path.expanduser(r'~/.zcode/reqslim/tls/ca-bundle.pem'); print(p, os.path.isfile(p))"
+```
+Windows 还应确认 `ZCODE_AGENT_CA_CERT` 指向该 bundle（用户级）：
+```bat
+reg query HKCU\Environment /v ZCODE_AGENT_CA_CERT
+```
 
 **失败分支**：安装器报 `cannot bind` 类错误不会在这一步（安装器不绑端口）；
 端口冲突在步骤 6 才暴露，见下。
@@ -261,23 +275,23 @@ python -c "import json; d=json.load(open(r'<HOME>/.zcode/reqslim/zcode-builtin.p
 自启模式下代理由 `proxy_autostart.pyw`（pythonw 无窗口）拉起，输出在 `~/.zcode/reqslim/proxy.log`；重复触发启动项无害——代理检测到等价实例在跑会直接退出。
 
 **启动器已内置健康探测**：`start-zcode.bat` 会在启动 ZCode 前轮询
-`http://127.0.0.1:8788/v1/health`（最多 10 次）；代理没起来（端口被占、导入失败）
+`https://127.0.0.1:8788/v1/health`（最多 10 次）；代理没起来（端口被占、导入失败）
 时启动器会停下并提示看代理窗口，**不会**把 ZCode 指向死端口。
-启动约 5 秒后做下面的探测作为复核：
+启动约 5 秒后做下面的探测作为复核（本机私有 CA，故用 `-k`/跳过校验）：
 
 ```bash
-curl -s http://127.0.0.1:8788/v1/health
+curl -sk https://127.0.0.1:8788/v1/health
 # 或无 curl 时（Windows）：
-powershell -NoProfile -Command "irm http://127.0.0.1:8788/v1/health"
+python -c "import ssl,urllib.request;print(urllib.request.build_opener(urllib.request.HTTPSHandler(context=ssl._create_unverified_context())).open('https://127.0.0.1:8788/v1/health',timeout=5).read().decode())"
 ```
 
 **预期**：
 
 ```json
-{"ok": true, "upstreams": {"8788": "https://...", "8789": "https://..."}, "cache": true, "coalesce": true}
+{"ok": true, "upstreams": {"8788": "https://...", "8789": "https://..."}, "cache": true, "coalesce": true, "tls": true}
 ```
 
-`upstreams` 的端口→URL 映射必须与步骤 3 确定的 `$UPSTREAMS` 一致。
+`upstreams` 的端口→URL 映射必须与步骤 3 确定的 `$UPSTREAMS` 一致，且 `tls` 为 `true`（除非明确使用 `--no-tls`）。
 
 **失败分支**：
 
@@ -287,42 +301,44 @@ powershell -NoProfile -Command "irm http://127.0.0.1:8788/v1/health"
   - `reqslim cannot be imported` → 回步骤 1 的验证，检查 `$REQSLIM` 位置是否被挪动。
   - 修好后**重新跑安装器**再启动（启动器内嵌端口，改口必须重装）。
 - 健康检查 OK 但 ZCode 请求全挂 → 逐层确认 provider 的 `baseUrl` 真的指向 `127.0.0.1`：环境变量表 `~/.zcode/reqslim/zcode-builtin.proxied.json` **之外**，还要查运行时缓存表 `~/.zcode/v2/runtime/provider/<版本>/endpoint-*/zcode-builtin.json`（agent 宿主优先读它）；改写后必须重启 ZCode 才会重建 provider registry。
+- ZCode 日志出现 `ClientRequestSigningV4Error: Client signing handshake requires HTTPS.` → 监听是 HTTP 或 `ZCODE_AGENT_CA_CERT` 未生效/证书不受信。重跑安装器（不要加 `--no-tls`），确认 `tls` 为 `true`，并重启 ZCode。
 
-**验收（三选一都过才算完成）**：
+**验收（以下三项任一通过即可）**：
 
 1. 在 ZCode 里随便跑一轮对话，然后：
-   `curl -s http://127.0.0.1:8788/v1/stats` → `requests` 计数增长；
-2. `curl -s http://127.0.0.1:8788/v1/report` → 出现 `requests / cache hits / tokens` 报告；
+   `curl -sk https://127.0.0.1:8788/v1/stats` → `requests` 计数增长；
+2. `curl -sk https://127.0.0.1:8788/v1/report` → 顶部出现 `request reduction` 区块，且 `estimated requests >= actual requests`；同时有 `requests / cache hits / tokens` 明细；
 3. `~/.zcode/reqslim/requests.jsonl` 存在且行数在增长（只记哈希与计数，**不含 prompt 内容**）。
 
 ---
 
 ## 7. 日常使用与回滚
 
-**日常**：以后每次都用 `start-zcode.bat`（或 `.sh`）启动 ZCode。直接开 ZCode = 不走代理（不报错，只是没有削减）。
+**日常**：安装默认已注册登录自启，并改写运行时缓存；直接打开 ZCode 即走代理。`start-zcode.bat`（或 `.sh`）只是手动兜底，它会检查所有监听端口，已就绪时不会重复起代理。`--no-autostart` 模式才必须先用启动器起代理，再打开 ZCode；直接双击 ZCode 会连到死端口。
 
 **看数据**：
 
 ```bash
-curl http://127.0.0.1:8788/v1/report              # 实时
+curl -sk https://127.0.0.1:8788/v1/report         # 实时（-k：本机私有 CA）
 python -m reqslim.zcode --report "<HOME>/.zcode/reqslim/requests.jsonl"   # 离线
 ```
 
-**回滚**（零残留，ZCode 自身从未被改动）：
+**回滚**（先停代理，再还原缓存，ZCode 自身从未被改动）：
 
-1. 直接正常启动 ZCode（不经启动器）→ 立即恢复原行为；
-2. 彻底清除：删 `~/.zcode/reqslim/` 目录 + `$REQSLIM` 下四个生成物
-   （`start-zcode.bat|.sh`、`zcode-stats.bat`、`zcode-report.bat`）。
-   也可以整目录删除 `$REQSLIM`。
+```bash
+python tools/install_zcode.py --uninstall
+```
+
+它会停止运行中的代理、删除自启项/两个用户环境变量（含 `ZCODE_AGENT_CA_CERT`）、删除 `tls/`、还原 `.bak-reqslim` 缓存表，并保留 `requests.jsonl`。需要零残留时再手动删除 `$REQSLIM` 下四个生成物（`start-zcode.bat|.sh`、`zcode-stats.bat`、`zcode-report.bat`）以及 `~/.zcode/reqslim/`。0.2.2 旧代理没有 `/v1/shutdown`，若卸载器提示停不下来，先手动结束代理或重启一次。
 
 ---
 
 ## 8. 已知限制（向用户转述时不要漏）
 
-- 只处理 `anthropic-messages` 协议；OpenAI 兼容 provider 不在改写范围。
+- 只代理 Anthropic Messages 端点（`/v1/messages`、`/v1/messages/count_tokens`）；OpenAI 兼容 provider 不在改写范围。
 - **macOS / Linux 路径未经实机验证**（开发机为 Windows）；POSIX 分支代码在但无实机背书。
-- 超过 1 MB 的请求体不缓存（内存保护）；流式命中回放无打字机效果；同端口第二个进程会拒绝启动而非抢流。
-- 缓存/合并/失败记忆按上游分区——不同网关的缓存互不串用（这是设计约束，不是 bug）。
+- 超过 1 MB 的请求体不写入缓存（内存保护，但同一时刻的单飞交接仍共享）；流式命中回放无打字机效果；同端口第二个进程会拒绝启动而非抢流。
+- 缓存/合并/失败记忆按网关 + 凭据 + beta/version 分区——不同网关或账号互不串用（这是设计约束，不是 bug）。
 - 完整清单见 README「已知限制」与 `ZCode接入指南.md` 第 11 节。
 
 ---

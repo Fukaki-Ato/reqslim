@@ -21,7 +21,7 @@ and the replay emits the same shapes back.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Mapping
 
 #: Block types whose payload arrives entirely in content_block_start.
 _WHOLE_BLOCK = frozenset({"redacted_thinking"})
@@ -49,12 +49,40 @@ class Assembler:
         #: Set by ``message_stop``, the stream's explicit terminator.
         self.stopped = False
 
-    def feed(self, event: dict[str, Any]) -> None:
+    @staticmethod
+    def _index(event: Mapping[str, Any]) -> int:
+        value = event.get("index", 0)
+        if isinstance(value, bool) or not isinstance(value, int):
+            if isinstance(value, str) and value.strip().isdigit():
+                value = int(value)
+            else:
+                raise ValueError(f"invalid content index: {value!r}")
+        if value < 0:
+            raise ValueError(f"negative content index: {value}")
+        return value
+
+    def feed(self, event: Any) -> None:
+        """Consume one SSE event, never letting malformed input escape.
+
+        Upstream JSON is untrusted input. A gateway sending ``null`` for an
+        index or a string in ``delta`` must not kill the client's stream; it
+        marks the assembly unusable instead.
+        """
         self.events += 1
+        try:
+            self._feed(event)
+        except (TypeError, ValueError, AttributeError, KeyError, json.JSONDecodeError):
+            self.malformed = True
+
+    def _feed(self, event: Any) -> None:
+        if not isinstance(event, Mapping):
+            raise ValueError("event must be an object")
         kind = event.get("type")
 
         if kind == "message_start":
-            started = event.get("message") or {}
+            started = event.get("message")
+            if not isinstance(started, Mapping):
+                raise ValueError("message_start.message must be an object")
             self.message.update(started)
             self.message.setdefault("content", [])
             self.message.setdefault("usage", {"input_tokens": 0, "output_tokens": 0})
@@ -67,46 +95,72 @@ class Assembler:
             self.error = event.get("error") or {"type": "error"}
 
         elif kind == "content_block_start":
-            index = int(event.get("index", 0))
-            block = dict(event.get("content_block") or {})
+            index = self._index(event)
+            content_block = event.get("content_block")
+            if not isinstance(content_block, Mapping):
+                raise ValueError("content_block must be an object")
+            block = dict(content_block)
             if block.get("type") == "tool_use":
                 block.setdefault("input", {})
                 self._partial[index] = ""
             self._blocks[index] = block
 
         elif kind == "content_block_delta":
-            index = int(event.get("index", 0))
-            delta = event.get("delta") or {}
+            index = self._index(event)
+            delta = event.get("delta")
+            if not isinstance(delta, Mapping):
+                raise ValueError("delta must be an object")
             block = self._blocks.setdefault(index, {"type": "text", "text": ""})
             if "text" in delta:
-                block["text"] = block.get("text", "") + delta["text"]
+                text = delta["text"]
+                if not isinstance(text, str):
+                    raise ValueError("text_delta.text must be a string")
+                block["text"] = block.get("text", "") + text
             elif "thinking" in delta:
-                block["thinking"] = block.get("thinking", "") + delta["thinking"]
+                thinking = delta["thinking"]
+                if not isinstance(thinking, str):
+                    raise ValueError("thinking_delta.thinking must be a string")
+                block["thinking"] = block.get("thinking", "") + thinking
             elif "signature" in delta:
-                block["signature"] = delta["signature"]
+                signature = delta["signature"]
+                if not isinstance(signature, str):
+                    raise ValueError("signature_delta.signature must be a string")
+                block["signature"] = signature
             elif "partial_json" in delta:
-                self._partial[index] = self._partial.get(index, "") + delta["partial_json"]
+                partial = delta["partial_json"]
+                if not isinstance(partial, str):
+                    raise ValueError("input_json_delta.partial_json must be a string")
+                self._partial[index] = self._partial.get(index, "") + partial
 
         elif kind == "content_block_stop":
-            index = int(event.get("index", 0))
+            index = self._index(event)
             if index in self._partial:
                 raw = self._partial.pop(index)
                 try:
-                    self._blocks[index]["input"] = json.loads(raw) if raw.strip() else {}
+                    parsed = json.loads(raw) if raw.strip() else {}
                 except json.JSONDecodeError:
+                    parsed = None
+                if not isinstance(parsed, dict):
                     # A truncated tool input is not a usable response; keep the
                     # raw string so the failure is visible rather than silent,
                     # and flag the assembly so it is never cached.
+                    self._blocks.setdefault(index, {"type": "tool_use", "input": {}})
                     self._blocks[index]["input"] = {}
                     self._blocks[index]["_malformed_input"] = raw
                     self.malformed = True
+                else:
+                    self._blocks[index]["input"] = parsed
 
         elif kind == "message_delta":
-            delta = event.get("delta") or {}
+            delta = event.get("delta")
+            if not isinstance(delta, Mapping):
+                raise ValueError("message_delta.delta must be an object")
             for field in ("stop_reason", "stop_sequence"):
                 if field in delta:
                     self.message[field] = delta[field]
-            usage = event.get("usage") or {}
+            usage = event.get("usage")
+            if usage is not None and not isinstance(usage, Mapping):
+                raise ValueError("message_delta.usage must be an object")
             if usage:
                 merged = dict(self.message.get("usage") or {})
                 merged.update(usage)
@@ -133,17 +187,21 @@ class Assembler:
         Either terminator counts as finished: ``message_stop`` is the explicit
         one, and a ``stop_reason`` means the stream got past the content and
         only missed the marker. Requiring both would switch the cache off for
-        any gateway that sends one but not the other.
+        any gateway that sends one but not the other. ``stop_reason`` itself is
+        mandatory: ``message_stop`` alone is a stream that stopped before
+        ``message_delta``, and replaying it would hand clients a null stop
+        reason. Every tool input must also have been closed.
         """
         return (
             self.error is None
             and not self.malformed
             and bool(self._blocks)
-            and (self.stopped or self.message.get("stop_reason") is not None)
+            and not self._partial
+            and self.message.get("stop_reason") is not None
         )
 
 
-def _blank(block: dict[str, Any]) -> dict[str, Any]:
+def _blank(block: Mapping[str, Any]) -> dict[str, Any]:
     kind = block.get("type", "text")
     if kind == "text":
         return {"type": "text", "text": ""}
@@ -159,49 +217,60 @@ def _blank(block: dict[str, Any]) -> dict[str, Any]:
     return dict(block)
 
 
-def _deltas(index: int, block: dict[str, Any]) -> list[dict[str, Any]]:
+def _deltas(index: int, block: Mapping[str, Any]) -> list[dict[str, Any]]:
     kind = block.get("type", "text")
     if kind == "text":
         text = block.get("text", "")
         return (
             [{"type": "content_block_delta", "index": index,
               "delta": {"type": "text_delta", "text": text}}]
-            if text
+            if isinstance(text, str) and text
             else []
         )
     if kind == "thinking":
         out = []
         thinking = block.get("thinking", "")
-        if thinking:
+        if isinstance(thinking, str) and thinking:
             out.append({"type": "content_block_delta", "index": index,
                         "delta": {"type": "thinking_delta", "thinking": thinking}})
         signature = block.get("signature")
-        if signature:
+        if isinstance(signature, str) and signature:
             out.append({"type": "content_block_delta", "index": index,
                         "delta": {"type": "signature_delta", "signature": signature}})
         return out
     if kind == "tool_use":
+        tool_input = block.get("input")
+        if not isinstance(tool_input, dict):
+            tool_input = {}
         return [
             {
                 "type": "content_block_delta",
                 "index": index,
                 "delta": {
                     "type": "input_json_delta",
-                    "partial_json": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                    "partial_json": json.dumps(tool_input, ensure_ascii=False),
                 },
             }
         ]
     return []
 
 
-def replay_sse(message: dict[str, Any]) -> bytes:
+def replay_sse(message: Any) -> bytes:
     """Rebuild an SSE stream that is faithful to the stored message."""
+    if not isinstance(message, Mapping):
+        message = {}
+    content = message.get("content")
+    if not isinstance(content, list):
+        content = []
+    usage = message.get("usage")
+    if not isinstance(usage, Mapping):
+        usage = {}
     head = {
         **message,
         "content": [],
         "stop_reason": None,
         "stop_sequence": None,
-        "usage": {**(message.get("usage") or {}), "output_tokens": 0},
+        "usage": {**usage, "output_tokens": 0},
     }
     out: list[str] = []
 
@@ -209,7 +278,9 @@ def replay_sse(message: dict[str, Any]) -> bytes:
         out.append(f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n")
 
     emit("message_start", {"type": "message_start", "message": head})
-    for index, block in enumerate(message.get("content") or []):
+    for index, block in enumerate(content):
+        if not isinstance(block, Mapping):
+            continue
         kind = block.get("type", "text")
         start_block = dict(block) if kind in _WHOLE_BLOCK else _blank(block)
         emit(
@@ -227,7 +298,7 @@ def replay_sse(message: dict[str, Any]) -> bytes:
                 "stop_reason": message.get("stop_reason"),
                 "stop_sequence": message.get("stop_sequence"),
             },
-            "usage": {"output_tokens": (message.get("usage") or {}).get("output_tokens", 0)},
+            "usage": {"output_tokens": usage.get("output_tokens", 0)},
         },
     )
     emit("message_stop", {"type": "message_stop"})
@@ -250,6 +321,11 @@ def usable(message: Any) -> bool:
     # cache for that provider. An explicit non-message type is still rejected.
     if message.get("type") not in (None, "message"):
         return False
+    if message.get("stop_reason") is None:
+        return False
+    usage = message.get("usage")
+    if usage is not None and not isinstance(usage, Mapping):
+        return False
     content = message.get("content")
     if not isinstance(content, list) or not content:
         return False
@@ -257,8 +333,26 @@ def usable(message: Any) -> bool:
     # parse; they are diagnostics, not protocol fields, and must not reach a
     # client or the cache.
     for block in content:
-        if isinstance(block, dict) and any(str(key).startswith("_") for key in block):
+        if not isinstance(block, Mapping):
             return False
+        if any(str(key).startswith("_") for key in block):
+            return False
+        kind = block.get("type")
+        if not isinstance(kind, str) or not kind:
+            return False
+        if kind == "text" and not isinstance(block.get("text"), str):
+            return False
+        if kind == "thinking":
+            if not isinstance(block.get("thinking"), str):
+                return False
+            signature = block.get("signature")
+            if signature is not None and not isinstance(signature, str):
+                return False
+        if kind == "tool_use":
+            if not isinstance(block.get("id"), str) or not isinstance(block.get("name"), str):
+                return False
+            if not isinstance(block.get("input"), dict):
+                return False
     return True
 
 

@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.5 (2026-11-04)
+
+**请求削减对比：预估请求次数 vs 实际上游调用**
+
+- 新增纯后端模块 `reqslim/zcode/comparison.py`：`compare_requests()` 以 `Event.hit` 为唯一口径，计算 `estimated_requests`（ZCode 逻辑请求数）、`actual_requests`（真正打到上游的次数）、`reduced_requests` 与减少比例，并按 `raw` / `normalized` / `coalesced` / `failure_memo` 归因
+- 计数守恒：`actual + sum(by_mechanism) == estimated`；空/非法 `hit` 值按上游调用处理，避免虚报节省
+- `/v1/stats` 新增 `comparison` 对象；`/v1/report` 顶部新增醒目的 `request reduction` 区块，直接显示减少量；旧字段 `requests` / `upstream` / `hits` 保留兼容
+- 测试 77 → 80：覆盖对比守恒、非法/非字符串 hit、离线损坏记录、报告输出与 `/v1/stats` 暴露
+
+## 0.2.4 (2026-11-04)
+
+**ZCode 3.17.2 真实请求打通：本机 HTTPS + 客户端签名握手**
+
+- **根因**：ZCode 3.17 对套餐账号启用客户端请求签名，签名器构造阶段拒绝 `http://` baseURL（`ClientRequestSigningV4Error: Client signing handshake requires HTTPS.`）。旧实现把 provider 指向 HTTP 本机端口，请求在发出前就失败，上游只看到缺少 `Authorization` 的 401；这不是账号凭据问题
+- **本机 TLS**：新增 `reqslim/zcode/tls.py`，安装器用 OpenSSL 生成私有 CA、`127.0.0.1`/`localhost` 服务器证书和 `ca-bundle.pem`（系统根 + 私有 CA），代理所有监听改为 HTTPS；`ZCODE_AGENT_CA_CERT` 设为用户级环境变量，只让 ZCode 信任本机监听
+- **签名握手转发**：代理新增 `/api/paas/...` 透传，按 provider **origin** 转发（不再错误拼成 `/api/anthropic/api/paas/...`），保留 `Authorization` 与全部签名头，且不进入缓存/流量记录
+- **生命周期**：`autostart.json` 记录 TLS 证书；`--autostart` 同时比较 transport，旧 HTTP 实例会自动停掉；`health_on_port`/`stop_running_proxy`/启动器按 scheme 探测；`--uninstall` 删除 `tls/` 与两个环境变量；`--no-tls` 仅保留给旧客户端/排查
+- **文档/测试**：README、README.en、ZCode 接入指南、AI 装配指南更新 HTTPS/CA/签名说明；测试 75 → 77（新增 HTTPS 监听与握手 origin 透传用例）
+- **本机实测**：ZCode 3.17.2 + 5 个 HTTPS 监听，真实请求 `requests.jsonl` 新增 6 条 200；同一提示第二次发送命中 `normalized` 缓存（`cache hits 1 / 16.7%`，tokens avoided ~469）
+
+## 0.2.3 (2026-11-03)
+
+**第三轮审计修复：协议安全、卸载/重装生命周期与本机 ZCode 3.17.2 验证**
+
+- **卸载/重装生命周期**：新增本地 `/v1/shutdown`，安装器与 `--uninstall` 先停旧代理再改缓存；修复“运行中的 CacheWatcher 把还原后的缓存重新改写回去”和 Windows 下 `proxy.log` 被占用导致卸载中断；换端口/换上游时从 `.bak-reqslim` 原始表重映射，不再把旧 loopback 端口误报为 `untouched`
+- **`--autostart` 参数与等价实例**：`autostart.json` 保存 `ttl/max_cache/cache/coalesce/coalesce_wait/failure_ttl`；安装器新增对应参数；启动前比较 health 的 `upstreams` 映射，映射不同或只起了一部分时先停旧实例；`--no-cache` 等不再静默失效
+- **请求体兼容**：支持 `Transfer-Encoding: chunked`（ZCode 3.17.2 的 agent 实际会用分块请求，旧实现会以 411/400 拒绝且不记录）
+- **运行时缓存只读**：改写后设只读，阻止 ZCode 云刷新在启动窗口覆盖回直连地址；ZCode 日志会记录 `EPERM` 并继续使用本地表，重跑安装器/卸载会处理只读标记
+- **协议/输入加固**：非对象 JSON 请求返回 400；非对象 200、非法 SSE 字段、非 dict content block、截断 tool input、合法 JSON 但错误表结构都转为受控 400/502/unreadable，不再让 handler/watcher 崩溃；`usable` 要求 stop_reason、合法 content block 与 usage
+- **流式与响应头**：流式请求遇到 200 非 SSE 返回 502，不再伪造成空 SSE；中途断流写 SSE `error` 事件并记 502；保留上游 `Content-Type`、`Retry-After` 等响应头；`message_stop` 缺 `message_delta` 不再缓存 null stop_reason；支持 `/v1/messages/count_tokens`
+- **请求路径/keep-alive**：不支持的 POST 路径关闭连接而不是留下未读 body；缺失/负数 Content-Length 拒绝、分块请求受支持；`urllib` 禁用环境代理与自动重定向，避免 POST 被改成 GET
+- **归因与分析**：新增 `coalesced` 命中档；超过 1 MB 或未缓存的成功/失败响应通过短寿命 handoff 共享，单飞不再只对大请求失效；分析按网关 + 凭据 + key 分组，跨网关不再误报 duplicates/storms
+- **缓存/规范化分区**：`cache_control` 只在 Anthropic 定义的位置剥离，工具 input/schema 中的同名字段保留；缓存/单飞/失败记忆加入凭据与 `anthropic-version` scope
+- **报告**：JSONL 轮转按 UTF-8 字节并保持在预算内；离线 `--report` 不再截断 5 万条；文件不存在返回非零；空报告补齐 `avg_latency`
+- 文档更新卸载/回滚/`--no-autostart`/轮转说明；测试 49 → 75；本机 ZCode 3.17.2 + 5 端口实例验证
+
 ## 0.2.2 (2026-11-03)
 
 **修复回归：恢复运行时 provider 缓存表改写（0.1.0 的关键修复在 0.2.0 重构中丢失）**
