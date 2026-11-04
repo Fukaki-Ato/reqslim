@@ -8,7 +8,7 @@ A request-reduction layer that sits in front of ZCode — **it never changes ans
 
 A coding agent burns dozens of turns and tool calls on a single task, and a large share of those requests are duplicates, predictable, or never needed the model at all. `reqslim` is a local proxy that intercepts them and keeps two separate ledgers — *how many times you logically asked* vs *how many times the upstream was physically hit* — so every saving is attributable to a specific mechanism.
 
-Zero third-party dependencies. Standard library only.
+Zero third-party Python dependencies at runtime; standard library only. The installer additionally needs `openssl` to create the local HTTPS certificate.
 
 ```
 ZCode ──HTTPS──> 127.0.0.1:8788 (reqslim) ──HTTPS──> upstream API
@@ -73,6 +73,20 @@ The first install routes only the primary BigModel gateway. If your plan uses
 another gateway such as `z.ai`, the installer lists it under `uncovered`; rerun
 once with `--extra-upstream <URL>` to route it too.
 
+### Verify the install
+
+1. Check the proxy:
+
+```bash
+curl -sk https://127.0.0.1:8788/v1/health
+```
+
+Expect `"ok": true`, `"tls": true`, and the full `upstreams` map.
+
+2. Open ZCode and send a minimal prompt (for example, "Reply with OK only").
+3. Open `zcode-stats.bat` or `https://127.0.0.1:8788/v1/report`. `requests` should be greater than 0 and the `request reduction` block should be visible.
+4. Create a new task and send the same prompt again; if it hits the cache, `reduced` and `by mechanism` should grow.
+
 Daily use: just open ZCode. `start-zcode.bat` remains as a manual fallback (debugging on a different port, or if the Startup entry is removed; it checks every listener first and will not start a duplicate proxy). Uninstall:
 
 ```bash
@@ -96,6 +110,19 @@ python tools/install_zcode.py \
 ```
 
 The installer prints which upstreams in the table are still not proxied.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `requests` stays 0 | provider not in the listener map, ZCode not restarted, or an old instance still running | Check `listen` / `uncovered`; quit ZCode from the tray and reopen; rerun the installer |
+| Launcher says `cannot bind` | port in use or inside a Windows reserved range | rerun the installer with `--port 18888` |
+| Installer cannot find `openssl` | no OpenSSL CLI | install Git for Windows; only older clients should consider `--no-tls` |
+| ZCode logs `ClientRequestSigningV4Error` | listener is HTTP, or ZCode did not load the local CA | do not use `--no-tls`; rerun the installer and restart ZCode |
+| ZCode logs `EPERM` / `Builtin 远端更新失败` | runtime cache is read-only so the cloud refresh cannot overwrite it | expected; rerun the installer or `--uninstall` to clear it |
+| Browser warns about the certificate | loopback HTTPS uses a private CA | use `zcode-stats.bat`, add `-k` to curl, or trust the local CA in the browser |
 
 ---
 
@@ -171,6 +198,7 @@ reqslim/
     ├── analytics.py   traffic recording & reporting
     ├── comparison.py  estimated vs actual upstream requests
     ├── proxy.py       proxy core
+    ├── tls.py         local HTTPS certificate and CA bundle
     └── __main__.py    CLI
 tools/install_zcode.py installer (probe + rewrite provider tables/caches + register autostart)
 tests/test_zcode.py    80 cases
@@ -192,6 +220,13 @@ Priority order; conflicts resolve in favor of the top:
 - **No response rewriting**
 - **No semantic guessing** — exact matching only, no embedding cache. Silently guessing is worse than not caching.
 
+## Privacy and security
+
+- Listens on `127.0.0.1` only, so the LAN cannot reach it.
+- `Authorization` and other credentials are forwarded with the request and never written to disk.
+- `requests.jsonl` records hashes, status, latency, token counts, tool names, and hit attribution — never prompt or response bodies.
+- The private CA key lives under `%USERPROFILE%\.zcode\reqslim\tls\`; `--uninstall` removes the certificate directory and the related environment variable.
+
 ## Known limitations
 
 - **Near-duplicates are not cached** — same question, longer history: the content genuinely differs, so it must not hit. These are counted in `near-dupes`.
@@ -204,3 +239,7 @@ Priority order; conflicts resolve in favor of the top:
 - **Runtime caches are read-only** — this stops ZCode's cloud refresher from overwriting the local table at startup; `EPERM` / "Builtin 远端更新失败，继续使用本地配置" in ZCode logs is expected. Re-run the installer or `--uninstall` to handle the flag.
 - **The loopback HTTPS listener uses a private CA** — its certificate covers only `127.0.0.1` / `localhost` and is exposed to ZCode through `ZCODE_AGENT_CA_CERT`; browsers or curl checking the report page need `-k`. `--uninstall` removes the certificate directory and the environment variable.
 - **macOS / Linux paths are untested on real hardware** — the development machine is Windows.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

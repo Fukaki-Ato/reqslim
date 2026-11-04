@@ -8,7 +8,7 @@
 
 编码 Agent 一个任务几十轮、几十次工具调用，其中大量请求是重复的、可预测的，或者根本不需要问模型。`reqslim` 是一个本地代理，把这些请求拦下来，把「逻辑上问了几次」和「物理上打了几次上游」分开记账，每一笔节省都能归因到具体机制。
 
-零第三方依赖，纯标准库。
+运行时零第三方 Python 依赖，纯标准库；安装器额外需要 `openssl` 生成本机 HTTPS 证书。
 
 ```
 ZCode ──HTTPS──> 127.0.0.1:8788（reqslim） ──HTTPS──> 上游 API
@@ -67,6 +67,20 @@ python tools/install_zcode.py
 
 首次安装只默认接入 BigModel 主网关。如果你的套餐走 `z.ai` 等其它网关，安装器会在 `uncovered` 行列出未接入的上游，按提示加 `--extra-upstream <URL>` 重跑一次即可。
 
+### 安装后验证
+
+1. 检查代理：
+
+```bash
+curl -sk https://127.0.0.1:8788/v1/health
+```
+
+预期包含 `"ok": true`、`"tls": true` 和完整的 `upstreams` 映射。
+
+2. 打开 ZCode，发一条最小提示（例如“只回复 OK”）。
+3. 双击 `zcode-stats.bat`，或打开 `https://127.0.0.1:8788/v1/report`。`requests` 应大于 0，顶部应出现 `request reduction` 区块。
+4. 新建任务重发同一提示；若命中缓存，`reduced` 和 `by mechanism` 应增长。
+
 日常使用：直接打开 ZCode 即可。`start-zcode.bat` 保留为手动兜底（换端口调试或自启项被清理时用；它会在启动前检查所有监听端口，已就绪则不再起第二个代理）。卸载：
 
 ```bash
@@ -90,6 +104,19 @@ python tools/install_zcode.py \
 ```
 
 安装器会提示表里还有哪些上游没接进来。
+
+---
+
+## 常见问题
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| `requests` 一直是 0 | provider 没进监听表、ZCode 没重启、或旧实例仍在跑 | 看安装器的 `listen` / `uncovered`；退出 ZCode 托盘进程后重开；重跑安装器 |
+| 启动器报 `cannot bind` | 端口被占用或落在 Windows 保留段 | 换 `--port 18888` 重跑安装器 |
+| 安装报找不到 `openssl` | 没有 OpenSSL CLI | 安装 Git for Windows；仅旧客户端才考虑 `--no-tls` |
+| ZCode 日志报 `ClientRequestSigningV4Error` | 监听是 HTTP，或 ZCode 没加载本机 CA | 不要用 `--no-tls`；重跑安装器并重启 ZCode |
+| ZCode 日志出现 `EPERM` / `Builtin 远端更新失败` | 运行时缓存被设为只读，阻止云刷新覆盖 | 预期行为；重跑安装器或 `--uninstall` 会处理 |
+| 浏览器提示证书不受信任 | 本机 HTTPS 使用私有 CA | 用 `zcode-stats.bat`，或对 curl 加 `-k`，或在浏览器中信任本机 CA |
 
 ---
 
@@ -183,6 +210,13 @@ docs/                  ZCode 接入指南
 - **不重写响应**
 - **不猜语义** —— 只做精确匹配，没有 embedding 缓存。默默猜一个比不缓存更糟。
 
+## 隐私与安全
+
+- 默认只监听 `127.0.0.1`，局域网无法访问。
+- `Authorization` 等凭据只随请求转发，不写入磁盘。
+- `requests.jsonl` 只记录哈希、状态、延迟、token 计数、工具名和命中归因，不记录 prompt / 响应正文。
+- 本机 CA 私钥在 `%USERPROFILE%\.zcode\reqslim\tls\`；`--uninstall` 会删除证书目录和对应环境变量。
+
 ## 已知限制
 
 - **近似重复缓存不了** —— 同一个问题但历史更长，内容确实不同，不该命中。这类会计入 `near-dupes`。
@@ -195,3 +229,7 @@ docs/                  ZCode 接入指南
 - **运行时缓存被设为只读** —— 阻止 ZCode 云刷新在启动窗口覆盖本地表；ZCode 日志中的 `EPERM` / `Builtin 远端更新失败，继续使用本地配置` 属预期，重跑安装器或 `--uninstall` 会处理只读标记。
 - **本机 HTTPS 使用私有 CA** —— 证书只含 `127.0.0.1` / `localhost`，通过 `ZCODE_AGENT_CA_CERT` 提供给 ZCode；浏览器或 curl 直接访问报告页需要 `-k`。`--uninstall` 会删除证书目录和该环境变量。
 - **macOS / Linux 路径未经实机验证** —— 开发机是 Windows。
+
+## License
+
+MIT，详见 [LICENSE](LICENSE)。
